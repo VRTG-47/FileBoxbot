@@ -1,9 +1,8 @@
 {
-  "$schema": "node_modules/wrangler/config-schema.json",
+  "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "iresiabot",
   "main": "worker.js",
   "compatibility_date": "2026-09-28",
-
   "d1_databases": [
     {
       "binding": "DB",
@@ -11,6 +10,4 @@
       "database_id": "e71d82da-a001-49b9-a1b3-1d50deeb37da"
     }
   ]
-    ]
-  }
 }
