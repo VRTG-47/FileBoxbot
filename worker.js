@@ -1,5571 +1,4324 @@
 const OWNER_ID = "7559560220";
 
-// ============================================================
-// Private RSS Reader
-// Cloudflare Workers + D1 + Telegram Bot
-//
-// 单用户私人 RSS Reader
-//
-// Secrets:
-//   BOT_TOKEN
-//
-// Optional Secret:
-//   TELEGRAPH_ACCESS_TOKEN
-//
-// D1:
-//   DB
-//
-// Cron:
-//   */5 * * * *
-// ============================================================
+const BOT_NAME = "伊蕾希娅";
 
-const CONFIG = {
-  DEFAULT_RSSHUB: "https://rsshub.app",
-
-  DEFAULT_INTERVAL: 10,
-
-  PAGE_SIZE: 8,
-
-  MAX_FEEDS_PER_RUN: 20,
-
-  MAX_ENTRIES_PER_FEED: 30,
-
-  MAX_MEDIA_PER_GROUP: 10,
-
-  MAX_FILTERS: 30,
-
-  RSS_TIMEOUT: 15000,
-
-  ARTICLE_TIMEOUT: 20000,
-
-  MAX_ARTICLE_LENGTH: 120000,
-
-  MAX_TELEGRAM_TEXT: 3900,
-
-  MAX_CAPTION: 950,
-
-  MAX_OPML_SIZE: 2 * 1024 * 1024,
-
-  USER_AGENT:
-    "PrivateRSSReader/1.0 (+Cloudflare Workers)",
-
-  TELEGRAPH_API:
-    "https://api.telegra.ph",
-};
-
-
-// ============================================================
-// Worker
-// ============================================================
+const MAX_INLINE = 20;
 
 export default {
-
-  async fetch(request, env, ctx) {
-
+  async fetch(request, env) {
     try {
-
       if (request.method === "GET") {
+        return new Response(`${BOT_NAME}在这里等候主人。`);
+      }
 
-        const url = new URL(request.url);
-
-        if (url.pathname === "/") {
-          return new Response(
-            "Private RSS Reader is running.",
-            { status: 200 }
-          );
-        }
-
-        if (url.pathname === "/health") {
-          return json({
-            ok: true,
-            service: "private-rss-reader",
-            owner: OWNER_ID,
-          });
-        }
-
-        return new Response("Not Found", {
-          status: 404,
+      if (request.method !== "POST") {
+        return new Response("Method Not Allowed", {
+          status: 405
         });
       }
 
-
-      if (request.method !== "POST") {
-        return new Response(
-          "Method Not Allowed",
-          { status: 405 }
-        );
-      }
-
-
-      const update = await request.json();
-
-      /*
-       * Telegram Webhook 必须快速返回。
-       * 实际处理交给 waitUntil。
-       */
-      ctx.waitUntil(
-        handleUpdate(update, env)
-          .catch(err => {
-            console.error("UPDATE ERROR", err);
-          })
-      );
+      await handleUpdate(await request.json(), env);
 
       return new Response("OK");
+    } catch (e) {
+      console.error("WORKER ERROR", e?.stack || e);
 
-    } catch (error) {
-
-      console.error("FETCH ERROR", error);
-
-      return new Response("OK");
+      return new Response("Internal Server Error", {
+        status: 500
+      });
     }
-  },
-
-
-  async scheduled(event, env, ctx) {
-
-    ctx.waitUntil(
-      runScheduler(env)
-        .catch(err => {
-          console.error("SCHEDULER ERROR", err);
-        })
-    );
-  },
-
+  }
 };
 
+async function telegram(method, body, env) {
+  const r = await fetch(
+    `https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(body)
+    }
+  );
 
-// ============================================================
-// Authorization
-// ============================================================
+  const data = await r.json();
 
-function getTelegramUserId(update) {
+  if (!data.ok) {
+    console.error(
+      "Telegram API Error",
+      method,
+      data
+    );
+  }
 
-  return String(
-    update?.message?.from?.id ??
-    update?.callback_query?.from?.id ??
-    update?.my_chat_member?.from?.id ??
-    ""
+  return data;
+}
+
+async function sendMessage(
+  chatId,
+  text,
+  options = {},
+  env
+) {
+  return telegram(
+    "sendMessage",
+    {
+      chat_id: chatId,
+      text,
+      parse_mode: "HTML",
+      ...options
+    },
+    env
   );
 }
 
-
-function isOwner(update) {
-
-  return getTelegramUserId(update) === OWNER_ID;
-}
-
-
-// ============================================================
-// Update Router
-// ============================================================
-
 async function handleUpdate(update, env) {
-
-  /*
-   * 第一层硬限制。
-   *
-   * 不是 OWNER_ID：
-   * 不回复
-   * 不处理
-   * 不写数据库
-   */
-  if (!isOwner(update)) {
-    return;
+  if (update.inline_query) {
+    return handleInlineQuery(
+      update.inline_query,
+      env
+    );
   }
-
 
   if (update.callback_query) {
+    const q = update.callback_query;
+    const userId = String(q.from.id);
 
-    return handleCallback(
-      update.callback_query,
-      env
-    );
-  }
-
-
-  if (update.message) {
-
-    return handleMessage(
-      update.message,
-      env
-    );
-  }
-}
-
-
-// ============================================================
-// Message Handler
-// ============================================================
-
-async function handleMessage(message, env) {
-
-  if (String(message.from?.id) !== OWNER_ID) {
-    return;
-  }
-
-
-  const chatId =
-    String(message.chat?.id || OWNER_ID);
-
-
-  // ----------------------------------------------------------
-  // OPML
-  // ----------------------------------------------------------
-
-  if (message.document) {
-
-    const filename =
-      String(
-        message.document.file_name || ""
-      ).toLowerCase();
-
-
-    if (
-      filename.endsWith(".opml") ||
-      filename.endsWith(".xml")
-    ) {
-
-      return importOPML(
-        chatId,
-        message.document,
+    if (userId !== OWNER_ID) {
+      await telegram(
+        "answerCallbackQuery",
+        {
+          callback_query_id: q.id,
+          text: "这是主人的私人文件库。",
+          show_alert: true
+        },
         env
       );
-    }
-  }
 
-
-  const text =
-    String(
-      message.text ||
-      message.caption ||
-      ""
-    ).trim();
-
-
-  if (!text) {
-    return;
-  }
-
-
-  // ----------------------------------------------------------
-  // Temporary states
-  // ----------------------------------------------------------
-
-  const state =
-    await getState(
-      env,
-      OWNER_ID
-    );
-
-
-  if (
-    state?.type === "rsshub" &&
-    !text.startsWith("/")
-  ) {
-
-    const value =
-      normalizeBaseUrl(text);
-
-
-    if (!value) {
-
-      return sendText(
-        chatId,
-        "❌ RSSHub Instance 地址无效。\n\n请输入 http(s) 地址。",
-        env
-      );
-    }
-
-
-    await saveRSSHub(
-      env,
-      OWNER_ID,
-      value
-    );
-
-
-    await clearState(
-      env,
-      OWNER_ID
-    );
-
-
-    return showSettings(
-      chatId,
-      env
-    );
-  }
-
-
-  if (
-    state?.type === "filter" &&
-    !text.startsWith("/")
-  ) {
-
-    const keyword =
-      text.trim();
-
-
-    if (!keyword) {
       return;
     }
 
-
-    await env.DB.prepare(`
-      INSERT INTO filters
-      (
-        feed_id,
-        mode,
-        keyword,
-        created_at
-      )
-      VALUES (?, ?, ?, ?)
-    `)
-      .bind(
-        state.feedId,
-        state.mode,
-        keyword,
-        now()
-      )
-      .run();
-
-
-    await clearState(
-      env,
-      OWNER_ID
-    );
-
-
-    return showFilters(
-      chatId,
-      state.feedId,
-      env
-    );
+    await handleCallback(q, env);
+    return;
   }
 
+  if (!update.message) return;
 
-  // ----------------------------------------------------------
-  // Commands
-  // ----------------------------------------------------------
+  const m = update.message;
+
+  const userId = String(
+    m.from?.id ?? m.chat?.id
+  );
+
+  const chatId = String(
+    m.chat?.id
+  );
+
+  if (userId !== OWNER_ID) {
+    await sendMessage(
+      chatId,
+      "抱歉，这里是主人的私人文件库。",
+      {},
+      env
+    );
+
+    return;
+  }
 
   if (
-    text === "/start" ||
-    text === "/menu"
+    m.document ||
+    m.video ||
+    m.audio ||
+    m.photo
   ) {
-
-    await clearState(
-      env,
-      OWNER_ID
-    );
-
-    return showMainMenu(
-      chatId,
-      env
-    );
+    return handleMediaMessage(m, env);
   }
 
-
-  if (text === "/help") {
-
-    return sendHelp(
-      chatId,
-      env
-    );
-  }
-
-
-  if (text === "/feeds") {
-
-    return showFeeds(
-      chatId,
-      0,
-      env
-    );
-  }
-
-
-  if (text === "/settings") {
-
-    return showSettings(
-      chatId,
-      env
-    );
-  }
-
-
-  if (text.startsWith("/add ")) {
-
-    const url =
-      text.slice(5).trim();
-
-    return addFeed(
-      chatId,
-      url,
-      env
-    );
-  }
-
-
-  if (text.startsWith("/")) {
-
-    return sendText(
-      chatId,
-      "❓ 未知命令。\n\n发送 /help 查看使用方法。",
-      env
-    );
-  }
-
-
-  // ----------------------------------------------------------
-  // Direct URL
-  // ----------------------------------------------------------
-
-  if (isHttpUrl(text)) {
-
-    return addFeed(
-      chatId,
-      text,
-      env
-    );
+  if (m.text) {
+    return handleText(m, env);
   }
 }
 
+async function handleText(m, env) {
+  const userId = String(
+    m.from?.id ?? m.chat.id
+  );
 
-// ============================================================
-// Callback Router
-// ============================================================
+  const chatId = String(
+    m.chat.id
+  );
 
-async function handleCallback(query, env) {
+  const text = String(
+    m.text || ""
+  ).trim();
+
+  if (text === "/start") {
+    await clearState(userId, env);
+    return sendHome(chatId, env);
+  }
+
+  if (text === "/help") {
+    return sendHelp(chatId, env);
+  }
+
+  const state = await getState(
+    userId,
+    env
+  );
 
   if (
-    String(query.from?.id) !== OWNER_ID
+    state &&
+    !state.startsWith(
+      "pending_resource:"
+    )
+  ) {
+    if (
+      await handleState(
+        m,
+        state,
+        env
+      )
+    ) {
+      return;
+    }
+  }
+
+  if (text === "📄 我的文件") {
+    return showRecentFiles(
+      userId,
+      chatId,
+      env
+    );
+  }
+
+  if (text === "📁 文件夹") {
+    return showFolderRoot(
+      userId,
+      chatId,
+      env
+    );
+  }
+
+  if (text === "🔎 搜索") {
+    await setState(
+      userId,
+      "search",
+      env
+    );
+
+    return sendMessage(
+      chatId,
+      "主人想找什么？\n\n可以输入文件名、文件 ID 或关键词。",
+      {},
+      env
+    );
+  }
+
+  if (containsUrl(text)) {
+    return handleLinkMessage(
+      m,
+      env
+    );
+  }
+
+  if (
+    await parseNaturalLanguage(
+      text,
+      userId,
+      chatId,
+      env
+    )
   ) {
     return;
   }
 
-
-  const chatId =
-    String(
-      query.message?.chat?.id ||
-      OWNER_ID
-    );
-
-
-  const messageId =
-    query.message?.message_id;
-
-
-  await tg(
-    "answerCallbackQuery",
-    {
-      callback_query_id:
-        query.id,
-    },
+  await sendMessage(
+    chatId,
+    "主人，我暂时没理解这句话。\n\n" +
+      "可以：\n" +
+      "📁 <code>创建 游戏/FGO/攻略</code>\n" +
+      "📂 <code>打开 游戏/FGO</code>\n" +
+      "🔎 <code>搜索 FGO</code>\n" +
+      "📦 <code>把刚才那个资源放到 游戏/FGO</code>\n" +
+      "🗑 <code>删除 游戏/FGO</code>",
+    {},
     env
-  ).catch(() => {});
-
-
-  const data =
-    String(query.data || "");
-
-
-  const [
-    action,
-    ...parts
-  ] = data.split(":");
-
-
-  switch (action) {
-
-    case "menu":
-      await clearState(env, OWNER_ID);
-      return showMainMenu(
-        chatId,
-        env,
-        messageId
-      );
-
-
-    case "add":
-      return showAddPrompt(
-        chatId,
-        env,
-        messageId
-      );
-
-
-    case "feeds":
-      return showFeeds(
-        chatId,
-        Number(parts[0] || 0),
-        env,
-        messageId
-      );
-
-
-    case "feed":
-      return showFeed(
-        chatId,
-        parts[0],
-        env,
-        messageId
-      );
-
-
-    case "feedtoggle":
-      return toggleFeed(
-        chatId,
-        parts[0],
-        env,
-        messageId
-      );
-
-
-    case "feeddelete":
-      return confirmDeleteFeed(
-        chatId,
-        parts[0],
-        env,
-        messageId
-      );
-
-
-    case "feeddeleteyes":
-      return deleteFeed(
-        chatId,
-        parts[0],
-        env,
-        messageId
-      );
-
-
-    case "type":
-      return showFeedTypes(
-        chatId,
-        parts[0],
-        env,
-        messageId
-      );
-
-
-    case "settype":
-      return setFeedType(
-        chatId,
-        parts[0],
-        parts[1],
-        env,
-        messageId
-      );
-
-
-    case "filter":
-      return showFilters(
-        chatId,
-        parts[0],
-        env,
-        messageId
-      );
-
-
-    case "filteradd":
-      return startFilterInput(
-        chatId,
-        parts[0],
-        parts[1],
-        env,
-        messageId
-      );
-
-
-    case "filterdel":
-      return deleteFilter(
-        chatId,
-        parts[0],
-        parts[1],
-        env,
-        messageId
-      );
-
-
-    case "rss":
-      return showRSSSettings(
-        chatId,
-        parts[0],
-        env,
-        messageId
-      );
-
-
-    case "interval":
-      return showIntervals(
-        chatId,
-        parts[0],
-        env,
-        messageId
-      );
-
-
-    case "setinterval":
-      return setIntervalForFeed(
-        chatId,
-        parts[0],
-        Number(parts[1]),
-        env,
-        messageId
-      );
-
-
-    case "settings":
-      return showSettings(
-        chatId,
-        env,
-        messageId
-      );
-
-
-    case "rsshub":
-      return showRSSHubSetting(
-        chatId,
-        env,
-        messageId
-      );
-
-
-    case "rsshubdefault":
-      return setRSSHub(
-        chatId,
-        CONFIG.DEFAULT_RSSHUB,
-        env,
-        messageId
-      );
-
-
-    case "opml":
-      return showOPMLMenu(
-        chatId,
-        env,
-        messageId
-      );
-
-
-    case "exportopml":
-      return exportOPML(
-        chatId,
-        env
-      );
-
-
-    default:
-      return showMainMenu(
-        chatId,
-        env,
-        messageId
-      );
-  }
+  );
 }
 
-
-// ============================================================
-// Main Menu
-// ============================================================
-
-async function showMainMenu(
-  chatId,
-  env,
-  messageId
-) {
-
-  const count =
-    await env.DB.prepare(`
-      SELECT COUNT(*) AS n
-      FROM subscriptions
-      WHERE user_id=?
-    `)
-      .bind(OWNER_ID)
-      .first();
-
-
-  const feedCount =
-    Number(count?.n || 0);
-
-
-  const text =
-`<b>📰 RSS Reader</b>
-
-私人 RSS 阅读器
-
-📡 当前订阅：<b>${feedCount}</b>
-
-将 RSS / RSSHub / Atom 订阅统一发送到 Telegram。
-
-直接发送 RSS 地址即可添加。`;
-
-
-  const keyboard = {
-    inline_keyboard: [
-
+function homeKeyboard() {
+  return {
+    keyboard: [
       [
         {
-          text: "📡 我的订阅",
-          callback_data: "feeds:0"
-        }
-      ],
-
-      [
-        {
-          text: "➕ 添加订阅",
-          callback_data: "add"
+          text: "📄 我的文件"
         },
         {
-          text: "⚙️ 设置",
-          callback_data: "settings"
+          text: "📁 文件夹"
         }
       ],
-
       [
         {
-          text: "📥📤 OPML",
-          callback_data: "opml"
-        },
-        {
-          text: "❔ 帮助",
-          callback_data: "help"
+          text: "🔎 搜索"
         }
       ]
-
-    ]
+    ],
+    resize_keyboard: true
   };
-
-
-  return editOrSend(
-    chatId,
-    messageId,
-    text,
-    keyboard,
-    env
-  );
 }
 
-
-// ============================================================
-// Add Prompt
-// ============================================================
-
-async function showAddPrompt(
+async function sendHome(
   chatId,
-  env,
-  messageId
+  env
 ) {
-
-  await clearState(
-    env,
-    OWNER_ID
-  );
-
-
-  const text =
-`<b>➕ 添加订阅</b>
-
-发送 RSS / Atom 地址。
-
-例如：
-
-<code>/add https://example.com/rss.xml</code>
-
-也可以直接发送：
-
-<code>https://example.com/rss.xml</code>
-
-添加后不会发送历史文章，只会从下一次更新开始推送。`;
-
-
-  return editOrSend(
+  return sendMessage(
     chatId,
-    messageId,
-    text,
+    `欢迎回来，主人。\n\n${BOT_NAME}一直在这里。`,
     {
-      inline_keyboard: [
-        [
-          {
-            text: "⬅️ 返回",
-            callback_data: "menu"
-          }
-        ]
-      ]
+      reply_markup: homeKeyboard()
     },
     env
   );
 }
-
-
-// ============================================================
-// Help
-// ============================================================
 
 async function sendHelp(
   chatId,
-  env,
-  messageId
-) {
-
-  const text =
-`<b>❔ 使用说明</b>
-
-<b>添加 RSS</b>
-<code>/add https://example.com/rss.xml</code>
-
-也可以直接发送 RSS URL。
-
-<b>订阅管理</b>
-/feeds
-
-<b>设置</b>
-/settings
-
-<b>推送逻辑</b>
-• 新订阅不会推送历史内容
-• 自动去重
-• 支持关键词过滤
-• 支持 RSSHub
-• 支持 OPML
-• 图片 / 视频自动媒体化
-• 文章自动生成 Telegraph 页面
-
-<b>支持的媒体</b>
-🖼 图片
-🎬 视频
-🎞 GIF
-📰 文章
-📝 普通 RSS`;
-
-
-  return editOrSend(
-    chatId,
-    messageId,
-    text,
-    {
-      inline_keyboard: [
-        [
-          {
-            text: "⬅️ 返回",
-            callback_data: "menu"
-          }
-        ]
-      ]
-    },
-    env
-  );
-}
-
-
-// ============================================================
-// Feed List
-// ============================================================
-
-async function showFeeds(
-  chatId,
-  page,
-  env,
-  messageId
-) {
-
-  const offset =
-    page * CONFIG.PAGE_SIZE;
-
-
-  const rows =
-    await env.DB.prepare(`
-      SELECT
-        f.id,
-        f.title,
-        f.site_url,
-        f.feed_type,
-        s.enabled,
-        s.interval_minutes
-      FROM subscriptions s
-      JOIN feeds f
-        ON f.id=s.feed_id
-      WHERE s.user_id=?
-      ORDER BY f.title COLLATE NOCASE
-      LIMIT ? OFFSET ?
-    `)
-      .bind(
-        OWNER_ID,
-        CONFIG.PAGE_SIZE,
-        offset
-      )
-      .all();
-
-
-  const items =
-    rows.results || [];
-
-
-  const totalRow =
-    await env.DB.prepare(`
-      SELECT COUNT(*) AS n
-      FROM subscriptions
-      WHERE user_id=?
-    `)
-      .bind(OWNER_ID)
-      .first();
-
-
-  const total =
-    Number(totalRow?.n || 0);
-
-
-  let text =
-`<b>📡 我的订阅</b>
-
-`;
-
-
-  if (!items.length) {
-
-    text +=
-`还没有订阅。
-
-点击「➕ 添加订阅」开始。`;
-
-  } else {
-
-    items.forEach(
-      (item, index) => {
-
-        const number =
-          offset + index + 1;
-
-        const status =
-          item.enabled
-            ? "🟢"
-            : "⏸️";
-
-
-        const title =
-          escapeHtml(
-            item.title ||
-            item.site_url ||
-            "未命名"
-          );
-
-
-        text +=
-`${status} <b>${number}</b>  ${title}\n`;
-      }
-    );
-
-  }
-
-
-  const keyboard = [];
-
-
-  for (
-    let i = 0;
-    i < items.length;
-    i += 2
-  ) {
-
-    const row = [];
-
-
-    for (
-      let j = i;
-      j < Math.min(i + 2, items.length);
-      j++
-    ) {
-
-      row.push({
-        text: String(offset + j + 1),
-        callback_data:
-          `feed:${items[j].id}`
-      });
-    }
-
-
-    keyboard.push(row);
-  }
-
-
-  const navigation = [];
-
-
-  if (page > 0) {
-
-    navigation.push({
-      text: "‹ 上一页",
-      callback_data:
-        `feeds:${page - 1}`
-    });
-  }
-
-
-  if (
-    offset + items.length < total
-  ) {
-
-    navigation.push({
-      text: "下一页 ›",
-      callback_data:
-        `feeds:${page + 1}`
-    });
-  }
-
-
-  if (navigation.length) {
-    keyboard.push(navigation);
-  }
-
-
-  keyboard.push([
-    {
-      text: "➕ 添加",
-      callback_data: "add"
-    },
-    {
-      text: "🏠 主菜单",
-      callback_data: "menu"
-    }
-  ]);
-
-
-  return editOrSend(
-    chatId,
-    messageId,
-    text,
-    {
-      inline_keyboard:
-        keyboard
-    },
-    env
-  );
-}
-
-
-// ============================================================
-// Feed Detail
-// ============================================================
-
-async function showFeed(
-  chatId,
-  feedId,
-  env,
-  messageId
-) {
-
-  const feed =
-    await getFeed(
-      feedId,
-      env
-    );
-
-
-  if (!feed) {
-
-    return editOrSend(
-      chatId,
-      messageId,
-      "❌ 找不到这个订阅。",
-      {
-        inline_keyboard: [
-          [
-            {
-              text: "⬅️ 我的订阅",
-              callback_data: "feeds:0"
-            }
-          ]
-        ]
-      },
-      env
-    );
-  }
-
-
-  const sub =
-    await env.DB.prepare(`
-      SELECT *
-      FROM subscriptions
-      WHERE user_id=?
-      AND feed_id=?
-    `)
-      .bind(
-        OWNER_ID,
-        feedId
-      )
-      .first();
-
-
-  const filterCount =
-    await env.DB.prepare(`
-      SELECT COUNT(*) AS n
-      FROM filters
-      WHERE feed_id=?
-    `)
-      .bind(feedId)
-      .first();
-
-
-  const typeNames = {
-
-    auto: "🤖 自动",
-
-    media: "🖼 媒体",
-
-    article: "📰 文章",
-
-    text: "📝 纯文本",
-
-  };
-
-
-  const type =
-    typeNames[feed.feed_type] ||
-    typeNames.auto;
-
-
-  const status =
-    sub?.enabled
-      ? "🟢 推送中"
-      : "⏸️ 已暂停";
-
-
-  const text =
-`<b>📡 ${escapeHtml(
-  feed.title || "未命名订阅"
-)}</b>
-
-${status}
-
-🎨 显示方式：${type}
-
-⏱ 检查周期：
-<b>${sub?.interval_minutes || CONFIG.DEFAULT_INTERVAL} 分钟</b>
-
-🔍 过滤规则：
-<b>${Number(filterCount?.n || 0)}</b>
-
-🔗 ${escapeHtml(
-  feed.site_url || feed.url
-)}`;
-
-
-  const keyboard = {
-    inline_keyboard: [
-
-      [
-        {
-          text: sub?.enabled
-            ? "⏸ 暂停推送"
-            : "▶️ 恢复推送",
-
-          callback_data:
-            `feedtoggle:${feedId}`
-        }
-      ],
-
-      [
-        {
-          text: "🎨 显示方式",
-          callback_data:
-            `type:${feedId}`
-        },
-
-        {
-          text: "🔍 关键词",
-          callback_data:
-            `filter:${feedId}`
-        }
-      ],
-
-      [
-        {
-          text: "⚙️ RSS 设置",
-          callback_data:
-            `rss:${feedId}`
-        }
-      ],
-
-      [
-        {
-          text: "🗑 删除订阅",
-          callback_data:
-            `feeddelete:${feedId}`
-        }
-      ],
-
-      [
-        {
-          text: "⬅️ 我的订阅",
-          callback_data:
-            "feeds:0"
-        }
-      ]
-
-    ]
-  };
-
-
-  return editOrSend(
-    chatId,
-    messageId,
-    text,
-    keyboard,
-    env
-  );
-}
-
-
-// ============================================================
-// Feed Type
-// ============================================================
-
-async function showFeedTypes(
-  chatId,
-  feedId,
-  env,
-  messageId
-) {
-
-  const text =
-`<b>🎨 显示方式</b>
-
-选择这个 RSS 的消息渲染方式。
-
-<b>🤖 自动</b>
-根据 RSS 内容自动判断。
-
-<b>🖼 媒体</b>
-图片 / 视频优先。
-
-<b>📰 文章</b>
-生成 Telegraph 阅读页面。
-
-<b>📝 纯文本</b>
-只发送 Telegram 文字。`;
-
-
-  const keyboard = {
-    inline_keyboard: [
-
-      [
-        {
-          text: "🤖 自动",
-          callback_data:
-            `settype:${feedId}:auto`
-        }
-      ],
-
-      [
-        {
-          text: "🖼 媒体",
-          callback_data:
-            `settype:${feedId}:media`
-        }
-      ],
-
-      [
-        {
-          text: "📰 文章",
-          callback_data:
-            `settype:${feedId}:article`
-        }
-      ],
-
-      [
-        {
-          text: "📝 纯文本",
-          callback_data:
-            `settype:${feedId}:text`
-        }
-      ],
-
-      [
-        {
-          text: "⬅️ 返回",
-          callback_data:
-            `feed:${feedId}`
-        }
-      ]
-
-    ]
-  };
-
-
-  return editOrSend(
-    chatId,
-    messageId,
-    text,
-    keyboard,
-    env
-  );
-}
-
-
-async function setFeedType(
-  chatId,
-  feedId,
-  type,
-  env,
-  messageId
-) {
-
-  if (
-    ![
-      "auto",
-      "media",
-      "article",
-      "text"
-    ].includes(type)
-  ) {
-    return;
-  }
-
-
-  await env.DB.prepare(`
-    UPDATE feeds
-    SET feed_type=?,
-        updated_at=?
-    WHERE id=?
-  `)
-    .bind(
-      type,
-      now(),
-      feedId
-    )
-    .run();
-
-
-  return showFeed(
-    chatId,
-    feedId,
-    env,
-    messageId
-  );
-}
-
-
-// ============================================================
-// Feed RSS Settings
-// ============================================================
-
-async function showRSSSettings(
-  chatId,
-  feedId,
-  env,
-  messageId
-) {
-
-  const feed =
-    await getFeed(
-      feedId,
-      env
-    );
-
-
-  if (!feed) {
-    return;
-  }
-
-
-  const sub =
-    await env.DB.prepare(`
-      SELECT *
-      FROM subscriptions
-      WHERE user_id=?
-      AND feed_id=?
-    `)
-      .bind(
-        OWNER_ID,
-        feedId
-      )
-      .first();
-
-
-  const text =
-`<b>⚙️ RSS 设置</b>
-
-<b>${escapeHtml(
-  feed.title
-)}</b>
-
-当前检查周期：
-
-⏱ <b>${
-  sub?.interval_minutes ||
-  CONFIG.DEFAULT_INTERVAL
-} 分钟</b>
-
-Worker 会按照这个周期检查 RSS。`;
-
-
-  return editOrSend(
-    chatId,
-    messageId,
-    text,
-    {
-      inline_keyboard: [
-
-        [
-          {
-            text: "⏱ 检查周期",
-            callback_data:
-              `interval:${feedId}`
-          }
-        ],
-
-        [
-          {
-            text: "⬅️ 返回",
-            callback_data:
-              `feed:${feedId}`
-          }
-        ]
-
-      ]
-    },
-    env
-  );
-}
-
-
-async function showIntervals(
-  chatId,
-  feedId,
-  env,
-  messageId
-) {
-
-  const values = [
-    5,
-    10,
-    30,
-    60,
-    180
-  ];
-
-
-  const keyboard =
-    values.map(
-      minutes => [
-
-        {
-          text:
-            minutes < 60
-              ? `${minutes} 分钟`
-              : `${minutes / 60} 小时`,
-
-          callback_data:
-            `setinterval:${feedId}:${minutes}`
-        }
-
-      ]
-    );
-
-
-  keyboard.push([
-    {
-      text: "⬅️ 返回",
-      callback_data:
-        `rss:${feedId}`
-    }
-  ]);
-
-
-  return editOrSend(
-    chatId,
-    messageId,
-    "<b>⏱ 检查周期</b>\n\n选择 RSS 检查频率。",
-    {
-      inline_keyboard:
-        keyboard
-    },
-    env
-  );
-}
-
-
-async function setIntervalForFeed(
-  chatId,
-  feedId,
-  minutes,
-  env,
-  messageId
-) {
-
-  if (
-    ![
-      5,
-      10,
-      30,
-      60,
-      180
-    ].includes(minutes)
-  ) {
-    return;
-  }
-
-
-  const next =
-    new Date(
-      Date.now() + minutes * 60000
-    ).toISOString();
-
-
-  await env.DB.prepare(`
-    UPDATE subscriptions
-    SET interval_minutes=?,
-        next_check_at=?,
-        updated_at=?
-    WHERE user_id=?
-    AND feed_id=?
-  `)
-    .bind(
-      minutes,
-      next,
-      now(),
-      OWNER_ID,
-      feedId
-    )
-    .run();
-
-
-  return showFeed(
-    chatId,
-    feedId,
-    env,
-    messageId
-  );
-}
-
-
-// ============================================================
-// Toggle
-// ============================================================
-
-async function toggleFeed(
-  chatId,
-  feedId,
-  env,
-  messageId
-) {
-
-  await env.DB.prepare(`
-    UPDATE subscriptions
-    SET enabled=
-      CASE
-        WHEN enabled=1 THEN 0
-        ELSE 1
-      END,
-      next_check_at=?,
-      updated_at=?
-    WHERE user_id=?
-    AND feed_id=?
-  `)
-    .bind(
-      now(),
-      now(),
-      OWNER_ID,
-      feedId
-    )
-    .run();
-
-
-  return showFeed(
-    chatId,
-    feedId,
-    env,
-    messageId
-  );
-}
-
-
-// ============================================================
-// Delete Feed
-// ============================================================
-
-async function confirmDeleteFeed(
-  chatId,
-  feedId,
-  env,
-  messageId
-) {
-
-  const feed =
-    await getFeed(
-      feedId,
-      env
-    );
-
-
-  if (!feed) {
-    return;
-  }
-
-
-  const text =
-`<b>🗑 删除订阅</b>
-
-确定删除：
-
-<b>${escapeHtml(
-  feed.title
-)}</b>
-
-删除后会同时清除：
-
-• 订阅关系
-• 历史 Entry
-• 关键词规则
-
-这个操作无法恢复。`;
-
-
-  return editOrSend(
-    chatId,
-    messageId,
-    text,
-    {
-      inline_keyboard: [
-
-        [
-          {
-            text: "🗑 确认删除",
-            callback_data:
-              `feeddeleteyes:${feedId}`
-          }
-        ],
-
-        [
-          {
-            text: "取消",
-            callback_data:
-              `feed:${feedId}`
-          }
-        ]
-
-      ]
-    },
-    env
-  );
-}
-
-
-async function deleteFeed(
-  chatId,
-  feedId,
-  env,
-  messageId
-) {
-
-  await env.DB.prepare(`
-    DELETE FROM subscriptions
-    WHERE user_id=?
-    AND feed_id=?
-  `)
-    .bind(
-      OWNER_ID,
-      feedId
-    )
-    .run();
-
-
-  const count =
-    await env.DB.prepare(`
-      SELECT COUNT(*) AS n
-      FROM subscriptions
-      WHERE feed_id=?
-    `)
-      .bind(feedId)
-      .first();
-
-
-  if (
-    Number(count?.n || 0) === 0
-  ) {
-
-    await env.DB.prepare(`
-      DELETE FROM filters
-      WHERE feed_id=?
-    `)
-      .bind(feedId)
-      .run();
-
-
-    await env.DB.prepare(`
-      DELETE FROM feed_entries
-      WHERE feed_id=?
-    `)
-      .bind(feedId)
-      .run();
-
-
-    await env.DB.prepare(`
-      DELETE FROM feeds
-      WHERE id=?
-    `)
-      .bind(feedId)
-      .run();
-  }
-
-
-  return showFeeds(
-    chatId,
-    0,
-    env,
-    messageId
-  );
-}
-
-
-// ============================================================
-// Filters
-// ============================================================
-
-async function showFilters(
-  chatId,
-  feedId,
-  env,
-  messageId
-) {
-
-  const rows =
-    await env.DB.prepare(`
-      SELECT id, mode, keyword
-      FROM filters
-      WHERE feed_id=?
-      ORDER BY id
-    `)
-      .bind(feedId)
-      .all();
-
-
-  const filters =
-    rows.results || [];
-
-
-  let text =
-`<b>🔍 关键词过滤</b>
-
-`;
-
-
-  if (!filters.length) {
-
-    text +=
-      "目前没有过滤规则。\n\n";
-
-  } else {
-
-    filters.forEach(
-      filter => {
-
-        const icon =
-          filter.mode === "include"
-            ? "🟢"
-            : "🔴";
-
-
-        const mode =
-          filter.mode === "include"
-            ? "包含"
-            : "排除";
-
-
-        text +=
-`${icon} <b>${mode}</b>  ${escapeHtml(
-  filter.keyword
-)}\n`;
-      }
-    );
-
-    text += "\n";
-  }
-
-
-  text +=
-`<b>匹配范围</b>
-
-标题
-摘要
-正文
-
-包含规则存在时：
-至少命中一个包含关键词。
-
-排除规则命中时：
-直接跳过该条目。`;
-
-
-  const keyboard = [];
-
-
-  keyboard.push([
-    {
-      text: "🟢 添加包含关键词",
-      callback_data:
-        `filteradd:${feedId}:include`
-    }
-  ]);
-
-
-  keyboard.push([
-    {
-      text: "🔴 添加排除关键词",
-      callback_data:
-        `filteradd:${feedId}:exclude`
-    }
-  ]);
-
-
-  for (const filter of filters) {
-
-    keyboard.push([
-      {
-        text:
-          `🗑 ${filter.keyword}`.slice(
-            0,
-            50
-          ),
-
-        callback_data:
-          `filterdel:${feedId}:${filter.id}`
-      }
-    ]);
-  }
-
-
-  keyboard.push([
-    {
-      text: "⬅️ 返回",
-      callback_data:
-        `feed:${feedId}`
-    }
-  ]);
-
-
-  return editOrSend(
-    chatId,
-    messageId,
-    text,
-    {
-      inline_keyboard:
-        keyboard
-    },
-    env
-  );
-}
-
-
-async function startFilterInput(
-  chatId,
-  feedId,
-  mode,
-  env,
-  messageId
-) {
-
-  const count =
-    await env.DB.prepare(`
-      SELECT COUNT(*) AS n
-      FROM filters
-      WHERE feed_id=?
-    `)
-      .bind(feedId)
-      .first();
-
-
-  if (
-    Number(count?.n || 0)
-    >= CONFIG.MAX_FILTERS
-  ) {
-
-    return editOrSend(
-      chatId,
-      messageId,
-      "❌ 这个订阅已经达到关键词规则上限。",
-      {
-        inline_keyboard: [
-          [
-            {
-              text: "⬅️ 返回",
-              callback_data:
-                `filter:${feedId}`
-            }
-          ]
-        ]
-      },
-      env
-    );
-  }
-
-
-  await setState(
-    env,
-    OWNER_ID,
-    {
-      type: "filter",
-      feedId,
-      mode
-    }
-  );
-
-
-  const name =
-    mode === "include"
-      ? "🟢 包含关键词"
-      : "🔴 排除关键词";
-
-
-  return editOrSend(
-    chatId,
-    messageId,
-    `<b>${name}</b>
-
-请直接发送关键词。
-
-例如：
-
-<code>OpenAI</code>
-
-发送后立即保存。
-
-取消：
-/menu`,
-    {
-      inline_keyboard: [
-        [
-          {
-            text: "取消",
-            callback_data:
-              `filter:${feedId}`
-          }
-        ]
-      ]
-    },
-    env
-  );
-}
-
-
-async function deleteFilter(
-  chatId,
-  feedId,
-  id,
-  env,
-  messageId
-) {
-
-  await env.DB.prepare(`
-    DELETE FROM filters
-    WHERE id=?
-    AND feed_id=?
-  `)
-    .bind(
-      id,
-      feedId
-    )
-    .run();
-
-
-  return showFilters(
-    chatId,
-    feedId,
-    env,
-    messageId
-  );
-}
-
-
-// ============================================================
-// Global Settings
-// ============================================================
-
-async function showSettings(
-  chatId,
-  env,
-  messageId
-) {
-
-  const settings =
-    await getSettings(
-      env,
-      OWNER_ID
-    );
-
-
-  const text =
-`<b>⚙️ 设置</b>
-
-<b>RSSHub Instance</b>
-
-<code>${escapeHtml(
-  settings.rsshub_instance
-)}</code>
-
-RSSHub 地址会应用于这个账号的所有 RSSHub 路由。
-
-此外还可以：
-
-• 导入 / 导出 OPML
-• 管理 RSSHub Instance`;
-
-
-  return editOrSend(
-    chatId,
-    messageId,
-    text,
-    {
-      inline_keyboard: [
-
-        [
-          {
-            text: "🔧 RSSHub Instance",
-            callback_data:
-              "rsshub"
-          }
-        ],
-
-        [
-          {
-            text: "📥📤 OPML",
-            callback_data:
-              "opml"
-          }
-        ],
-
-        [
-          {
-            text: "🏠 主菜单",
-            callback_data:
-              "menu"
-          }
-        ]
-
-      ]
-    },
-    env
-  );
-}
-
-
-// ============================================================
-// RSSHub
-// ============================================================
-
-async function showRSSHubSetting(
-  chatId,
-  env,
-  messageId
-) {
-
-  const settings =
-    await getSettings(
-      env,
-      OWNER_ID
-    );
-
-
-  await setState(
-    env,
-    OWNER_ID,
-    {
-      type: "rsshub"
-    }
-  );
-
-
-  const text =
-`<b>🔧 RSSHub Instance</b>
-
-当前实例：
-
-<code>${escapeHtml(
-  settings.rsshub_instance
-)}</code>
-
-直接发送新的实例地址。
-
-例如：
-
-<code>https://rsshub.example.com</code>
-
-保存后以后 RSSHub 路由会自动使用新的实例。`;
-
-
-  return editOrSend(
-    chatId,
-    messageId,
-    text,
-    {
-      inline_keyboard: [
-
-        [
-          {
-            text: "♻️ 恢复默认",
-            callback_data:
-              "rsshubdefault"
-          }
-        ],
-
-        [
-          {
-            text: "⬅️ 返回",
-            callback_data:
-              "settings"
-          }
-        ]
-
-      ]
-    },
-    env
-  );
-}
-
-
-async function setRSSHub(
-  chatId,
-  value,
-  env,
-  messageId
-) {
-
-  const normalized =
-    normalizeBaseUrl(value);
-
-
-  if (!normalized) {
-
-    return sendText(
-      chatId,
-      "❌ RSSHub Instance 无效。",
-      env
-    );
-  }
-
-
-  await saveRSSHub(
-    env,
-    OWNER_ID,
-    normalized
-  );
-
-
-  await clearState(
-    env,
-    OWNER_ID
-  );
-
-
-  return showSettings(
-    chatId,
-    env,
-    messageId
-  );
-}
-
-
-async function saveRSSHub(
-  env,
-  userId,
-  value
-) {
-
-  await env.DB.prepare(`
-    INSERT INTO user_settings
-    (
-      user_id,
-      rsshub_instance,
-      language
-    )
-    VALUES (?, ?, ?)
-
-    ON CONFLICT(user_id)
-    DO UPDATE SET
-      rsshub_instance=
-        excluded.rsshub_instance
-  `)
-    .bind(
-      userId,
-      value,
-      "zh-CN"
-    )
-    .run();
-}
-
-
-// ============================================================
-// OPML
-// ============================================================
-
-async function showOPMLMenu(
-  chatId,
-  env,
-  messageId
-) {
-
-  const text =
-`<b>📥📤 OPML</b>
-
-用于批量迁移 RSS 订阅。
-
-<b>📥 导入</b>
-直接把 .opml 文件发送给 Bot。
-
-<b>📤 导出</b>
-把当前所有订阅导出成 OPML。
-
-导入时不会发送 RSS 历史内容。`;
-
-
-  return editOrSend(
-    chatId,
-    messageId,
-    text,
-    {
-      inline_keyboard: [
-
-        [
-          {
-            text: "📤 导出 OPML",
-            callback_data:
-              "exportopml"
-          }
-        ],
-
-        [
-          {
-            text: "⬅️ 返回",
-            callback_data:
-              "settings"
-          }
-        ]
-
-      ]
-    },
-    env
-  );
-}
-
-
-async function importOPML(
-  chatId,
-  document,
   env
 ) {
+  return sendMessage(
+    chatId,
+    `<b>${BOT_NAME}文件管家</b>\n\n` +
+      `<b>📁 文件夹</b>\n` +
+      `创建 游戏\n` +
+      `创建 游戏/FGO/攻略\n` +
+      `打开 游戏/FGO\n` +
+      `删除 游戏/FGO\n` +
+      `把 FGO 改名为 命运冠位指定\n\n` +
+      `<b>📦 资源</b>\n` +
+      `直接发送文件、图片、视频、音频或链接。\n\n` +
+      `<b>🔎 搜索</b>\n` +
+      `搜索 文件名、ID 或关键词。\n\n` +
+      `<b>🆔 ID</b>\n` +
+      `资源自动获得自定义 ID，详情页可修改。\n` +
+      `取出资源后，可以直接在实际文件下面使用上一项/下一项浏览。`,
+    {},
+    env
+  );
+}
 
-  const status =
-    await sendText(
+/* -------------------- Resource intake -------------------- */
+
+async function handleMediaMessage(
+  m,
+  env
+) {
+  const userId = String(
+    m.from?.id ?? m.chat.id
+  );
+
+  const chatId = String(
+    m.chat.id
+  );
+
+  if (m.media_group_id) {
+    return handleMediaGroupItem(
+      m,
+      userId,
       chatId,
-      "⏳ 正在读取 OPML…",
+      env
+    );
+  }
+
+  const resource =
+    extractSingleMediaResource(m);
+
+  if (!resource) return;
+
+  const state =
+    await getState(
+      userId,
       env
     );
 
+  if (state?.startsWith("move_to:")) {
+    const folderId = Number(
+      state.slice(8)
+    );
 
-  try {
+    await clearState(
+      userId,
+      env
+    );
 
-    const file =
-      await tg(
-        "getFile",
-        {
-          file_id:
-            document.file_id
-        },
+    return finishSave(
+      userId,
+      chatId,
+      resource,
+      folderId,
+      env
+    );
+  }
+
+  return acceptIncomingResource(
+    userId,
+    chatId,
+    resource,
+    env
+  );
+}
+
+async function handleLinkMessage(
+  m,
+  env
+) {
+  const userId = String(
+    m.from?.id ?? m.chat.id
+  );
+
+  const chatId = String(
+    m.chat.id
+  );
+
+  const text = String(
+    m.text || ""
+  ).trim();
+
+  const url =
+    extractFirstUrl(text);
+
+  if (!url) return;
+
+  const resource = {
+    type: "link",
+    url,
+    text,
+    messageId: m.message_id,
+    createdAt: Date.now()
+  };
+
+  const state =
+    await getState(
+      userId,
+      env
+    );
+
+  if (state?.startsWith("move_to:")) {
+    const folderId = Number(
+      state.slice(8)
+    );
+
+    await clearState(
+      userId,
+      env
+    );
+
+    return finishSave(
+      userId,
+      chatId,
+      resource,
+      folderId,
+      env
+    );
+  }
+
+  return acceptIncomingResource(
+    userId,
+    chatId,
+    resource,
+    env
+  );
+}
+
+async function acceptIncomingResource(
+  userId,
+  chatId,
+  resource,
+  env
+) {
+  for (
+    let attempt = 0;
+    attempt < 4;
+    attempt++
+  ) {
+    const state =
+      await getStateRecord(
+        userId,
         env
       );
-
-
-    const path =
-      file.result?.file_path;
-
-
-    if (!path) {
-      throw new Error(
-        "无法获取 Telegram 文件"
-      );
-    }
-
-
-    const response =
-      await fetch(
-        `https://api.telegram.org/file/bot${env.BOT_TOKEN}/${path}`
-      );
-
-
-    const buffer =
-      await response.arrayBuffer();
-
 
     if (
-      buffer.byteLength >
-      CONFIG.MAX_OPML_SIZE
+      state?.state ===
+      "auto_archiving"
     ) {
-
-      throw new Error(
-        "OPML 文件过大"
-      );
-    }
-
-
-    const xml =
-      new TextDecoder()
-        .decode(buffer);
-
-
-    const urls =
-      parseOPML(xml);
-
-
-    if (!urls.length) {
-
-      throw new Error(
-        "没有发现有效 RSS URL"
-      );
-    }
-
-
-    let success = 0;
-    let failed = 0;
-
-
-    /*
-     * OPML 导入时不推送历史。
-     */
-    for (
-      const url of urls
-    ) {
-
-      try {
-
-        await addFeedInternal(
-          url,
-          env
-        );
-
-        success++;
-
-      } catch (error) {
-
-        failed++;
-
-        console.error(
-          "OPML FEED ERROR",
-          url,
-          error
-        );
-      }
-    }
-
-
-    const result =
-`<b>✅ OPML 导入完成</b>
-
-📡 RSS：<b>${urls.length}</b>
-
-🟢 成功：<b>${success}</b>
-🔴 失败：<b>${failed}</b>
-
-历史内容不会被推送。`;
-
-
-    return editMessage(
-      chatId,
-      status?.result?.message_id,
-      result,
-      {
-        inline_keyboard: [
-          [
-            {
-              text: "📡 我的订阅",
-              callback_data:
-                "feeds:0"
-            }
-          ]
-        ]
-      },
-      env
-    );
-
-  } catch (error) {
-
-    console.error(
-      "OPML IMPORT",
-      error
-    );
-
-
-    return editMessage(
-      chatId,
-      status?.result?.message_id,
-      `❌ <b>OPML 导入失败</b>
-
-${escapeHtml(
-  error.message || String(error)
-)}`,
-      {
-        inline_keyboard: [
-          [
-            {
-              text: "⬅️ 返回",
-              callback_data:
-                "opml"
-            }
-          ]
-        ]
-      },
-      env
-    );
-  }
-}
-
-
-async function exportOPML(
-  chatId,
-  env
-) {
-
-  const rows =
-    await env.DB.prepare(`
-      SELECT
-        f.title,
-        f.url,
-        f.site_url
-      FROM subscriptions s
-      JOIN feeds f
-        ON f.id=s.feed_id
-      WHERE s.user_id=?
-      ORDER BY f.title COLLATE NOCASE
-    `)
-      .bind(OWNER_ID)
-      .all();
-
-
-  const outlines =
-    (rows.results || [])
-      .map(
-        feed => {
-
-          const title =
-            xmlEscape(
-              feed.title ||
-              feed.url
-            );
-
-
-          const url =
-            xmlEscape(
-              feed.url
-            );
-
-
-          const htmlUrl =
-            xmlEscape(
-              feed.site_url ||
-              ""
-            );
-
-
-          return `
-<outline
- type="rss"
- text="${title}"
- title="${title}"
- xmlUrl="${url}"
- htmlUrl="${htmlUrl}"
- />`;
-        }
-      )
-      .join("");
-
-
-  const xml =
-`<?xml version="1.0" encoding="UTF-8"?>
-<opml version="2.0">
-
-<head>
-<title>Private RSS Reader</title>
-</head>
-
-<body>
-${outlines}
-</body>
-
-</opml>`;
-
-
-  const blob =
-    new Blob(
-      [xml],
-      {
-        type:
-          "text/x-opml;charset=utf-8"
-      }
-    );
-
-
-  return tgDocument(
-    chatId,
-    blob,
-    "subscriptions.opml",
-    "📤 OPML 导出完成",
-    env
-  );
-}
-
-
-// ============================================================
-// Add Feed
-// ============================================================
-
-async function addFeed(
-  chatId,
-  url,
-  env
-) {
-
-  const status =
-    await sendText(
-      chatId,
-      "⏳ 正在读取 RSS…",
-      env
-    );
-
-
-  try {
-
-    const feedId =
-      await addFeedInternal(
-        url,
-        env
-      );
-
-
-    const feed =
-      await getFeed(
-        feedId,
-        env
-      );
-
-
-    const text =
-`<b>✅ 订阅已添加</b>
-
-📡 <b>${escapeHtml(
-  feed.title
-)}</b>
-
-🔗 ${escapeHtml(
-  feed.url
-)}
-
-🟢 状态：推送中
-
-历史内容已记录。
-
-之后只推送新出现的内容。`;
-
-
-    return editMessage(
-      chatId,
-      status?.result?.message_id,
-      text,
-      {
-        inline_keyboard: [
-
-          [
-            {
-              text: "⚙️ 订阅设置",
-              callback_data:
-                `feed:${feedId}`
-            }
-          ],
-
-          [
-            {
-              text: "📡 我的订阅",
-              callback_data:
-                "feeds:0"
-            }
-          ]
-
-        ]
-      },
-      env
-    );
-
-  } catch (error) {
-
-    console.error(
-      "ADD FEED",
-      error
-    );
-
-
-    return editMessage(
-      chatId,
-      status?.result?.message_id,
-      `<b>❌ 添加失败</b>
-
-${escapeHtml(
-  error.message ||
-  String(error)
-)}`,
-      {
-        inline_keyboard: [
-          [
-            {
-              text: "➕ 重试",
-              callback_data:
-                "add"
-            }
-          ],
-          [
-            {
-              text: "🏠 主菜单",
-              callback_data:
-                "menu"
-            }
-          ]
-        ]
-      },
-      env
-    );
-  }
-}
-
-
-async function addFeedInternal(
-  originalUrl,
-  env
-) {
-
-  let url =
-    String(originalUrl || "")
-      .trim();
-
-
-  url =
-    await rewriteRSSHubUrl(
-      url,
-      env
-    );
-
-
-  if (!isHttpUrl(url)) {
-
-    throw new Error(
-      "URL 必须是 http(s) 地址"
-    );
-  }
-
-
-  const xml =
-    await fetchText(
-      url,
-      CONFIG.RSS_TIMEOUT,
-      {
-        Accept:
-          "application/rss+xml, application/atom+xml, application/xml, text/xml, */*"
-      }
-    );
-
-
-  const parsed =
-    parseFeed(
-      xml,
-      url
-    );
-
-
-  if (!parsed.items.length) {
-
-    throw new Error(
-      "没有发现 RSS / Atom 条目"
-    );
-  }
-
-
-  const existing =
-    await env.DB.prepare(`
-      SELECT id
-      FROM feeds
-      WHERE url=?
-    `)
-      .bind(url)
-      .first();
-
-
-  let feedId =
-    existing?.id;
-
-
-  if (!feedId) {
-
-    feedId =
-      crypto.randomUUID();
-
-
-    await env.DB.prepare(`
-      INSERT INTO feeds
-      (
-        id,
-        url,
-        title,
-        description,
-        site_url,
-        feed_type,
-        created_at,
-        updated_at
-      )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `)
-      .bind(
-        feedId,
-        url,
-        parsed.title ||
-          new URL(url).hostname,
-        parsed.description ||
-          "",
-        parsed.siteUrl ||
-          url,
-        "auto",
-        now(),
-        now()
-      )
-      .run();
-
-  } else {
-
-    await env.DB.prepare(`
-      UPDATE feeds
-      SET title=?,
-          description=?,
-          site_url=?,
-          updated_at=?
-      WHERE id=?
-    `)
-      .bind(
-        parsed.title ||
-          new URL(url).hostname,
-        parsed.description ||
-          "",
-        parsed.siteUrl ||
-          url,
-        now(),
-        feedId
-      )
-      .run();
-  }
-
-
-  await env.DB.prepare(`
-    INSERT INTO subscriptions
-    (
-      id,
-      user_id,
-      feed_id,
-      enabled,
-      interval_minutes,
-      next_check_at,
-      created_at,
-      updated_at
-    )
-    VALUES (?, ?, ?, 1, ?, ?, ?, ?)
-
-    ON CONFLICT(user_id, feed_id)
-    DO UPDATE SET
-      enabled=1,
-      updated_at=excluded.updated_at
-  `)
-    .bind(
-      crypto.randomUUID(),
-      OWNER_ID,
-      feedId,
-      CONFIG.DEFAULT_INTERVAL,
-      new Date(
-        Date.now() +
-        CONFIG.DEFAULT_INTERVAL *
-        60000
-      ).toISOString(),
-      now(),
-      now()
-    )
-    .run();
-
-
-  /*
-   * 核心：
-   *
-   * 添加订阅的时候，
-   * 把当前 RSS 中已有的 Entry
-   * 全部写入 feed_entries。
-   *
-   * 所以 Cron 第一次运行不会把旧文章发送出来。
-   */
-  for (
-    const item of
-      parsed.items.slice(
-        0,
-        CONFIG.MAX_ENTRIES_PER_FEED
-      )
-  ) {
-
-    await seedEntry(
-      env,
-      feedId,
-      item
-    );
-  }
-
-
-  return feedId;
-}
-
-
-// ============================================================
-// Scheduler
-// ============================================================
-
-async function runScheduler(env) {
-
-  const current =
-    now();
-
-
-  const rows =
-    await env.DB.prepare(`
-      SELECT
-        s.*,
-        f.*
-      FROM subscriptions s
-      JOIN feeds f
-        ON f.id=s.feed_id
-      WHERE s.user_id=?
-      AND s.enabled=1
-      AND (
-        s.next_check_at IS NULL
-        OR s.next_check_at<=?
-      )
-      ORDER BY
-        s.next_check_at
-      LIMIT ?
-    `)
-      .bind(
-        OWNER_ID,
-        current,
-        CONFIG.MAX_FEEDS_PER_RUN
-      )
-      .all();
-
-
-  for (
-    const row of
-      rows.results || []
-  ) {
-
-    try {
-
-      await processFeed(
-        row,
-        env
-      );
-
-
-      const minutes =
-        Number(
-          row.interval_minutes ||
-          CONFIG.DEFAULT_INTERVAL
-        );
-
-
-      const next =
-        new Date(
-          Date.now() +
-          minutes * 60000
-        ).toISOString();
-
-
-      await env.DB.prepare(`
-        UPDATE subscriptions
-        SET
-          next_check_at=?,
-          last_success_at=?,
-          last_error=NULL,
-          updated_at=?
-        WHERE user_id=?
-        AND feed_id=?
-      `)
-        .bind(
-          next,
-          now(),
-          now(),
-          OWNER_ID,
-          row.feed_id
-        )
-        .run();
-
-    } catch (error) {
-
-      console.error(
-        "FEED ERROR",
-        row.url,
-        error
-      );
-
-
-      const minutes =
-        Math.max(
-          10,
-          Number(
-            row.interval_minutes ||
-            CONFIG.DEFAULT_INTERVAL
-          )
-        );
-
-
-      const next =
-        new Date(
-          Date.now() +
-          minutes * 60000
-        ).toISOString();
-
-
-      await env.DB.prepare(`
-        UPDATE subscriptions
-        SET
-          next_check_at=?,
-          last_error=?,
-          updated_at=?
-        WHERE user_id=?
-        AND feed_id=?
-      `)
-        .bind(
-          next,
-          String(
-            error.message ||
-            error
-          ).slice(0, 1000),
-          now(),
-          OWNER_ID,
-          row.feed_id
-        )
-        .run();
-    }
-  }
-}
-
-
-// ============================================================
-// Process Feed
-// ============================================================
-
-async function processFeed(
-  feed,
-  env
-) {
-
-  const xml =
-    await fetchText(
-      feed.url,
-      CONFIG.RSS_TIMEOUT,
-      {
-        Accept:
-          "application/rss+xml, application/atom+xml, application/xml, text/xml, */*"
-      }
-    );
-
-
-  const parsed =
-    parseFeed(
-      xml,
-      feed.url
-    );
-
-
-  if (!parsed.items.length) {
-    return;
-  }
-
-
-  const newItems = [];
-
-
-  for (
-    const item of
-      parsed.items.slice(
-        0,
-        CONFIG.MAX_ENTRIES_PER_FEED
-      )
-  ) {
-
-    const id =
-      entryStableId(
-        feed.feed_id,
-        item
-      );
-
-
-    const existing =
-      await env.DB.prepare(`
-        SELECT id
-        FROM feed_entries
-        WHERE id=?
-      `)
-        .bind(id)
-        .first();
-
-
-    if (!existing) {
-
-      newItems.push({
-        id,
-        item,
-      });
-    }
-  }
-
-
-  /*
-   * RSS 通常最新文章在前面。
-   *
-   * 这里 reverse 后，
-   * 按发布时间从旧到新发送。
-   */
-  newItems.reverse();
-
-
-  for (
-    const entry of
-      newItems
-  ) {
-
-    const allowed =
-      await passesFilters(
-        entry.item,
-        feed.feed_id,
-        env
-      );
-
-
-    /*
-     * 即使被过滤掉，
-     * 也要记录 Entry。
-     *
-     * 否则下一轮会一直重复检查。
-     */
-    if (!allowed) {
-
-      await seedEntry(
-        env,
-        feed.feed_id,
-        entry.item,
-        entry.id
+      await new Promise(
+        r => setTimeout(r, 25)
       );
 
       continue;
     }
 
+    if (
+      state?.state?.startsWith(
+        "pending_resource:"
+      )
+    ) {
+      const old =
+        parsePendingResource(
+          state.state
+        );
 
-    await deliverEntry(
-      feed,
-      entry.item,
+      if (!state.last_folder_id) {
+        await sendMessage(
+          chatId,
+          "主人，还有一个资源正在等待整理。请先选择它的文件夹。",
+          {},
+          env
+        );
+
+        return;
+      }
+
+      const claimed =
+        await claimPending(
+          userId,
+          state.state,
+          env
+        );
+
+      if (!claimed) continue;
+
+      try {
+        await saveAndReplacePending(
+          userId,
+          chatId,
+          old,
+          Number(
+            state.last_folder_id
+          ),
+          resource,
+          env
+        );
+
+        return;
+      } catch (e) {
+        console.error(
+          "AUTO ARCHIVE ERROR",
+          e?.stack || e
+        );
+
+        await setPendingResource(
+          userId,
+          old,
+          env
+        );
+
+        await sendMessage(
+          chatId,
+          "自动归档上一个资源时失败了，我暂时保留原资源。",
+          {},
+          env
+        );
+
+        return;
+      }
+    }
+
+    await setPendingResource(
+      userId,
+      resource,
       env
     );
 
+    await chooseFolderForUpload(
+      userId,
+      chatId,
+      env
+    );
 
-    await seedEntry(
-      env,
-      feed.feed_id,
-      entry.item,
-      entry.id
+    return;
+  }
+
+  await sendMessage(
+    chatId,
+    "正在处理上一条资源，请稍后再发送。",
+    {},
+    env
+  );
+}
+
+async function saveAndReplacePending(
+  userId,
+  chatId,
+  oldResource,
+  oldFolderId,
+  newResource,
+  env
+) {
+  const oldResult =
+    await prepareSave(
+      userId,
+      oldResource,
+      oldFolderId,
+      env
+    );
+
+  const newState =
+    pendingState(
+      newResource
+    );
+
+  await env.DB.batch([
+    oldResult.statement,
+
+    env.DB.prepare(`
+      UPDATE user_states
+      SET state = ?,
+          last_folder_id = ?,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE chat_id = ?
+        AND state = ?
+    `).bind(
+      newState,
+      oldFolderId,
+      userId,
+      "auto_archiving"
+    )
+  ]);
+
+  await showBatchProgress(
+    userId,
+    chatId,
+    oldResult.result,
+    env
+  );
+
+  await chooseFolderForUpload(
+    userId,
+    chatId,
+    env
+  );
+}
+
+async function finishSave(
+  userId,
+  chatId,
+  resource,
+  folderId,
+  env
+) {
+  try {
+    const before =
+      await getStateRecord(
+        userId,
+        env
+      );
+
+    const prepared =
+      await prepareSave(
+        userId,
+        resource,
+        folderId,
+        env
+      );
+
+    await env.DB.batch([
+      prepared.statement,
+
+      env.DB.prepare(`
+        INSERT INTO user_states(
+          chat_id,
+          state,
+          last_folder_id,
+          progress_message_id,
+          batch_done,
+          batch_total,
+          updated_at
+        )
+        VALUES(
+          ?,
+          ?,
+          ?,
+          ?,
+          ?,
+          ?,
+          CURRENT_TIMESTAMP
+        )
+        ON CONFLICT(chat_id)
+        DO UPDATE SET
+          state = '',
+          last_folder_id = excluded.last_folder_id,
+          progress_message_id = NULL,
+          batch_done = 0,
+          batch_total = 0,
+          updated_at = CURRENT_TIMESTAMP
+      `).bind(
+        userId,
+        null,
+        folderId,
+        null,
+        0,
+        0
+      )
+    ]);
+
+    if (
+      before?.progress_message_id
+    ) {
+      await telegram(
+        "editMessageText",
+        {
+          chat_id: chatId,
+          message_id:
+            Number(
+              before.progress_message_id
+            ),
+          text:
+            `✅ 归档完成\n\n` +
+            `📄 <b>${escapeHtml(
+              prepared.result.fileName
+            )}</b>\n` +
+            `📁 <code>${escapeHtml(
+              prepared.result.folderPath
+            )}</code>\n` +
+            `🆔 <code>${escapeHtml(
+              prepared.result.customId
+            )}</code>`,
+          parse_mode: "HTML"
+        },
+        env
+      );
+    } else {
+      await sendSavedMessage(
+        chatId,
+        prepared.result,
+        env
+      );
+    }
+  } catch (e) {
+    console.error(
+      "SAVE ERROR",
+      e?.stack || e
+    );
+
+    await setPendingResource(
+      userId,
+      resource,
+      env
+    );
+
+    await sendMessage(
+      chatId,
+      e?.code === "DUPLICATE" ||
+      /unique|constraint/i.test(
+        e?.message || ""
+      )
+        ? "文件已存在，已拒绝重复插入。"
+        : "主人，保存失败了。我保留了这个资源，请再选择一次文件夹。",
+      {},
+      env
     );
   }
 }
 
+function pendingState(resource) {
+  if (!resource._pendingToken) {
+    resource._pendingToken =
+      crypto.randomUUID();
+  }
 
-// ============================================================
-// Filters
-// ============================================================
+  return (
+    "pending_resource:" +
+    encodeURIComponent(
+      JSON.stringify(resource)
+    )
+  );
+}
 
-async function passesFilters(
-  item,
-  feedId,
+function parsePendingResource(
+  state
+) {
+  try {
+    return JSON.parse(
+      decodeURIComponent(
+        state.slice(
+          "pending_resource:".length
+        )
+      )
+    );
+  } catch {
+    return null;
+  }
+}
+
+async function setPendingResource(
+  userId,
+  resource,
   env
 ) {
+  await setState(
+    userId,
+    pendingState(resource),
+    env
+  );
+}
 
-  const rows =
+async function claimPending(
+  userId,
+  oldState,
+  env
+) {
+  const r =
     await env.DB.prepare(`
-      SELECT mode, keyword
-      FROM filters
-      WHERE feed_id=?
-    `)
-      .bind(feedId)
-      .all();
+      UPDATE user_states
+      SET state = ?,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE chat_id = ?
+        AND state = ?
+    `).bind(
+      "auto_archiving",
+      userId,
+      oldState
+    ).run();
 
+  return (
+    Number(
+      r.meta?.changes || 0
+    ) === 1
+  );
+}
 
-  const filters =
-    rows.results || [];
+function extractSingleMediaResource(
+  m
+) {
+  if (m.photo) {
+    const x =
+      m.photo.at(-1);
 
+    return {
+      type: "file",
+      fileId: x.file_id,
+      fileUniqueId:
+        x.file_unique_id,
+      fileName:
+        `图片_${m.message_id}.jpg`,
+      fileSize:
+        x.file_size || null,
+      mimeType: "image/jpeg",
+      caption:
+        m.caption || "",
+      messageId:
+        m.message_id
+    };
+  }
 
-  if (!filters.length) {
+  if (m.document) {
+    const x =
+      m.document;
+
+    return {
+      type: "file",
+      fileId: x.file_id,
+      fileUniqueId:
+        x.file_unique_id,
+      fileName:
+        x.file_name ||
+        `文件_${m.message_id}`,
+      fileSize:
+        x.file_size || null,
+      mimeType:
+        x.mime_type ||
+        "application/octet-stream",
+      caption:
+        m.caption || "",
+      messageId:
+        m.message_id
+    };
+  }
+
+  if (m.video) {
+    const x =
+      m.video;
+
+    return {
+      type: "file",
+      fileId: x.file_id,
+      fileUniqueId:
+        x.file_unique_id,
+      fileName:
+        x.file_name ||
+        `视频_${m.message_id}.mp4`,
+      fileSize:
+        x.file_size || null,
+      mimeType:
+        x.mime_type ||
+        "video/mp4",
+      caption:
+        m.caption || "",
+      messageId:
+        m.message_id
+    };
+  }
+
+  if (m.audio) {
+    const x =
+      m.audio;
+
+    return {
+      type: "file",
+      fileId: x.file_id,
+      fileUniqueId:
+        x.file_unique_id,
+      fileName:
+        x.file_name ||
+        x.title ||
+        `音频_${m.message_id}`,
+      fileSize:
+        x.file_size || null,
+      mimeType:
+        x.mime_type ||
+        "audio/mpeg",
+      caption:
+        m.caption || "",
+      messageId:
+        m.message_id
+    };
+  }
+
+  return null;
+}
+
+async function handleMediaGroupItem(
+  m,
+  userId,
+  chatId,
+  env
+) {
+  const item =
+    extractMediaGroupItem(m);
+
+  if (!item) return;
+
+  const groupId =
+    String(m.media_group_id);
+
+  const state =
+    await getStateRecord(
+      userId,
+      env
+    );
+
+  if (
+    state?.state ===
+    "auto_archiving"
+  ) {
+    await new Promise(
+      r => setTimeout(r, 25)
+    );
+
+    return handleMediaGroupItem(
+      m,
+      userId,
+      chatId,
+      env
+    );
+  }
+
+  if (
+    state?.state?.startsWith(
+      "pending_resource:"
+    )
+  ) {
+    const resource =
+      parsePendingResource(
+        state.state
+      );
+
+    if (
+      resource?.type ===
+        "media_group" &&
+      String(
+        resource.mediaGroupId
+      ) === groupId
+    ) {
+      return appendMediaGroupItem(
+        userId,
+        state.state,
+        resource,
+        item,
+        env
+      );
+    }
+
+    if (state.last_folder_id) {
+      const old = resource;
+
+      const claimed =
+        await claimPending(
+          userId,
+          state.state,
+          env
+        );
+
+      if (claimed && old) {
+        await saveAndReplacePending(
+          userId,
+          chatId,
+          old,
+          Number(
+            state.last_folder_id
+          ),
+          makeMediaGroup(
+            groupId,
+            item
+          ),
+          env
+        );
+
+        return;
+      }
+    } else {
+      await sendMessage(
+        chatId,
+        "还有一个资源正在等待整理，请先选择文件夹。",
+        {},
+        env
+      );
+
+      return;
+    }
+  }
+
+  const resource =
+    makeMediaGroup(
+      groupId,
+      item
+    );
+
+  await setPendingResource(
+    userId,
+    resource,
+    env
+  );
+
+  await chooseFolderForUpload(
+    userId,
+    chatId,
+    env
+  );
+}
+
+function makeMediaGroup(
+  groupId,
+  item
+) {
+  return {
+    type: "media_group",
+    mediaGroupId: groupId,
+    items: [item],
+    createdAt: Date.now()
+  };
+}
+
+function extractMediaGroupItem(
+  m
+) {
+  const x =
+    extractSingleMediaResource(m);
+
+  if (!x) return null;
+
+  return {
+    kind:
+      x.mimeType.startsWith(
+        "image/"
+      )
+        ? "photo"
+        : x.mimeType.startsWith(
+            "video/"
+          )
+          ? "video"
+          : x.mimeType.startsWith(
+              "audio/"
+            )
+            ? "audio"
+            : "document",
+
+    fileId: x.fileId,
+    fileUniqueId:
+      x.fileUniqueId,
+    fileName: x.fileName,
+    fileSize: x.fileSize,
+    mimeType: x.mimeType,
+    caption: x.caption,
+    messageId: x.messageId
+  };
+}
+
+async function appendMediaGroupItem(
+  userId,
+  oldState,
+  resource,
+  item,
+  env
+) {
+  if (
+    resource.items.some(
+      x =>
+        String(x.messageId) ===
+        String(item.messageId)
+    )
+  ) {
     return true;
   }
 
+  resource.items.push(item);
 
-  const haystack =
-    (
-      String(item.title || "") +
-      "\n" +
-      String(item.summary || "") +
-      "\n" +
-      stripHtml(
-        item.content || ""
-      )
-    ).toLocaleLowerCase();
+  resource.items.sort(
+    (a, b) =>
+      Number(a.messageId) -
+      Number(b.messageId)
+  );
 
+  const next =
+    pendingState(resource);
 
-  const includes =
-    filters.filter(
-      x => x.mode === "include"
-    );
-
-
-  const excludes =
-    filters.filter(
-      x => x.mode === "exclude"
-    );
-
-
-  if (
-    excludes.some(
-      x =>
-        haystack.includes(
-          String(
-            x.keyword
-          ).toLocaleLowerCase()
-        )
-    )
-  ) {
-
-    return false;
-  }
-
+  const r =
+    await env.DB.prepare(`
+      UPDATE user_states
+      SET state = ?,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE chat_id = ?
+        AND state = ?
+    `).bind(
+      next,
+      userId,
+      oldState
+    ).run();
 
   if (
-    includes.length &&
-    !includes.some(
-      x =>
-        haystack.includes(
-          String(
-            x.keyword
-          ).toLocaleLowerCase()
-        )
-    )
+    Number(
+      r.meta?.changes || 0
+    ) === 1
   ) {
-
-    return false;
+    return true;
   }
 
+  const latest =
+    await getState(
+      userId,
+      env
+    );
+
+  if (
+    latest?.startsWith(
+      "pending_resource:"
+    )
+  ) {
+    return appendMediaGroupItem(
+      userId,
+      latest,
+      parsePendingResource(
+        latest
+      ),
+      item,
+      env
+    );
+  }
 
   return true;
 }
 
+/* -------------------- Folder picker -------------------- */
 
-// ============================================================
-// Renderer
-// ============================================================
-
-async function deliverEntry(
-  feed,
-  item,
+async function chooseFolderForUpload(
+  userId,
+  chatId,
   env
 ) {
-
-  const type =
-    feed.feed_type === "auto"
-      ? classifyEntry(item)
-      : feed.feed_type;
-
-
-  if (type === "media") {
-
-    if (item.media.length) {
-
-      return deliverMedia(
-        feed,
-        item,
-        env
-      );
-    }
-
-    return deliverText(
-      feed,
-      item,
-      env
-    );
-  }
-
-
-  if (type === "article") {
-
-    return deliverArticle(
-      feed,
-      item,
-      env
-    );
-  }
-
-
-  if (type === "text") {
-
-    return deliverText(
-      feed,
-      item,
-      env
-    );
-  }
-
-
-  if (item.media.length) {
-
-    return deliverMedia(
-      feed,
-      item,
-      env
-    );
-  }
-
-
-  /*
-   * 有文章链接并且正文较长，
-   * 使用 Telegraph。
-   */
-  if (
-    item.link &&
-    (
-      stripHtml(
-        item.content || ""
-      ).length > 500 ||
-      stripHtml(
-        item.summary || ""
-      ).length > 500
-    )
-  ) {
-
-    return deliverArticle(
-      feed,
-      item,
-      env
-    );
-  }
-
-
-  return deliverText(
-    feed,
-    item,
+  return showUploadFolders(
+    userId,
+    chatId,
+    null,
     env
   );
 }
 
-
-function classifyEntry(item) {
-
-  if (
-    item.media &&
-    item.media.length
-  ) {
-
-    return "media";
-  }
-
-
-  const text =
-    stripHtml(
-      item.content ||
-      item.summary ||
-      ""
-    );
-
-
-  if (
-    item.link &&
-    text.length > 300
-  ) {
-
-    return "article";
-  }
-
-
-  return "text";
-}
-
-
-// ============================================================
-// Media Renderer
-// ============================================================
-
-async function deliverMedia(
-  feed,
-  item,
+async function showUploadFolders(
+  userId,
+  chatId,
+  parentId,
   env
 ) {
-
-  const media =
-    (item.media || [])
-      .filter(
-        m =>
-          isHttpUrl(m.url)
-      );
-
-
-  if (!media.length) {
-
-    return deliverText(
-      feed,
-      item,
+  const folders =
+    await queryFolders(
+      userId,
+      parentId,
       env
     );
+
+  const buttons = [];
+
+  for (const f of folders) {
+    buttons.push([
+      {
+        text: `📥 ${f.name}`,
+        callback_data:
+          `uploadhere:${f.id}`
+      },
+      {
+        text: "📂 进入",
+        callback_data:
+          `uploadbrowse:${f.id}`
+      }
+    ]);
   }
 
+  if (parentId !== null) {
+    buttons.push([
+      {
+        text: "📥 保存到当前文件夹",
+        callback_data:
+          `uploadhere:${parentId}`
+      }
+    ]);
 
-  const caption =
-    buildMediaCaption(
-      feed,
-      item
-    );
-
-
-  /*
-   * Telegram sendMediaGroup
-   * 每组最多 10 个媒体。
-   */
-  const groups = [];
-
-
-  for (
-    let i = 0;
-    i < media.length;
-    i += CONFIG.MAX_MEDIA_PER_GROUP
-  ) {
-
-    groups.push(
-      media.slice(
-        i,
-        i + CONFIG.MAX_MEDIA_PER_GROUP
-      )
-    );
-  }
-
-
-  for (
-    let groupIndex = 0;
-    groupIndex < groups.length;
-    groupIndex++
-  ) {
-
-    const group =
-      groups[groupIndex];
-
-
-    if (group.length === 1) {
-
-      await sendSingleMedia(
-        OWNER_ID,
-        group[0],
-        groupIndex === 0
-          ? caption
-          : "",
+    const f =
+      await getFolder(
+        userId,
+        parentId,
         env
       );
 
-      continue;
-    }
-
-
-    const payload =
-      group.map(
-        (mediaItem, index) => {
-
-          const input =
-            mediaInput(
-              mediaItem
-            );
-
-
-          /*
-           * 只有第一组第一个媒体
-           * 放正文。
-           */
-          if (
-            groupIndex === 0 &&
-            index === 0
-          ) {
-
-            input.caption =
-              caption;
-
-            input.parse_mode =
-              "HTML";
-          }
-
-
-          return input;
+    if (f?.parent_id !== null) {
+      buttons.push([
+        {
+          text: "⬆️ 上一级",
+          callback_data:
+            `uploadbrowse:${f.parent_id}`
         }
-      );
-
-
-    await tg(
-      "sendMediaGroup",
-      {
-        chat_id: OWNER_ID,
-        media: payload
-      },
-      env
-    );
+      ]);
+    }
   }
 
-
-  /*
-   * 原文单独放在最后。
-   */
-  if (item.link) {
-
-    await sendText(
-      OWNER_ID,
-      "🔗 <b>查看原文</b>",
-      env,
-      [
-        [
-          {
-            text: "打开原文",
-            url: item.link
-          }
-        ]
-      ]
-    );
-  }
-}
-
-
-function mediaInput(media) {
-
-  const type =
-    media.type === "video"
-      ? "video"
-      : media.type === "animation"
-        ? "animation"
-        : "photo";
-
-
-  return {
-    type,
-    media: media.url,
-  };
-}
-
-
-async function sendSingleMedia(
-  chatId,
-  media,
-  caption,
-  env,
-  keyboard
-) {
-
-  const replyMarkup =
-    keyboard
-      ? JSON.stringify({
-          inline_keyboard:
-            keyboard
-        })
-      : undefined;
-
-
-  if (
-    media.type === "video"
-  ) {
-
-    return tg(
-      "sendVideo",
-      {
-        chat_id: chatId,
-        video: media.url,
-        caption:
-          caption || undefined,
-        parse_mode:
-          caption
-            ? "HTML"
-            : undefined,
-        reply_markup:
-          replyMarkup
-      },
-      env
-    );
-  }
-
-
-  if (
-    media.type === "animation"
-  ) {
-
-    return tg(
-      "sendAnimation",
-      {
-        chat_id: chatId,
-        animation: media.url,
-        caption:
-          caption || undefined,
-        parse_mode:
-          caption
-            ? "HTML"
-            : undefined,
-        reply_markup:
-          replyMarkup
-      },
-      env
-    );
-  }
-
-
-  return tg(
-    "sendPhoto",
+  await sendMessage(
+    chatId,
+    parentId === null
+      ? "主人，这个资源准备放在哪里呢？"
+      : "主人，可以直接保存到当前文件夹，也可以进入子文件夹。",
     {
-      chat_id: chatId,
-      photo: media.url,
-      caption:
-        caption || undefined,
-      parse_mode:
-        caption
-          ? "HTML"
-          : undefined,
-      reply_markup:
-        replyMarkup
+      reply_markup: {
+        inline_keyboard:
+          buttons
+      }
     },
     env
   );
 }
 
+/* -------------------- Callback -------------------- */
 
-function buildMediaCaption(
-  feed,
-  item
-) {
-
-  let text =
-`<b>📡 ${escapeHtml(
-  feed.title ||
-  "RSS"
-)}</b>`;
-
-
-  if (item.author) {
-
-    text +=
-      `\n\n👤 ${escapeHtml(
-        item.author
-      )}`;
-  }
-
-
-  if (item.title) {
-
-    text +=
-      `\n\n<b>${escapeHtml(
-        item.title
-      )}</b>`;
-  }
-
-
-  const body =
-    stripHtml(
-      item.summary ||
-      item.content ||
-      ""
-    );
-
-
-  if (body) {
-
-    text +=
-      `\n\n${escapeHtml(
-        body.slice(
-          0,
-          CONFIG.MAX_CAPTION - 150
-        )
-      )}`;
-  }
-
-
-  return text.slice(
-    0,
-    CONFIG.MAX_CAPTION
-  );
-}
-
-
-// ============================================================
-// Article Renderer
-// ============================================================
-
-async function deliverArticle(
-  feed,
-  item,
+async function handleCallback(
+  q,
   env
 ) {
+  const userId =
+    String(q.from.id);
 
-  let telegraphUrl =
-    null;
+  const chatId =
+    String(q.message.chat.id);
 
+  const data =
+    String(q.data || "");
 
-  try {
+  await telegram(
+    "answerCallbackQuery",
+    {
+      callback_query_id: q.id
+    },
+    env
+  );
 
-    telegraphUrl =
-      await createTelegraphArticle(
-        feed,
-        item,
+  if (
+    data.startsWith(
+      "uploadbrowse:"
+    )
+  ) {
+    return showUploadFolders(
+      userId,
+      chatId,
+      Number(
+        data.slice(13)
+      ),
+      env
+    );
+  }
+
+  if (
+    data.startsWith(
+      "uploadhere:"
+    )
+  ) {
+    const folderId =
+      Number(
+        data.slice(11)
+      );
+
+    const state =
+      await getState(
+        userId,
         env
       );
 
-  } catch (error) {
+    const resource =
+      state?.startsWith(
+        "pending_resource:"
+      )
+        ? parsePendingResource(
+            state
+          )
+        : null;
 
-    console.error(
-      "TELEGRAPH ERROR",
-      error
+    if (!resource) {
+      return sendMessage(
+        chatId,
+        "这个待整理资源已经处理过了，请重新发送。",
+        {},
+        env
+      );
+    }
+
+    if (
+      !(await getFolder(
+        userId,
+        folderId,
+        env
+      ))
+    ) {
+      return sendMessage(
+        chatId,
+        "这个文件夹已经不存在了。",
+        {},
+        env
+      );
+    }
+
+    const claimed =
+      await claimPending(
+        userId,
+        state,
+        env
+      );
+
+    if (!claimed) {
+      return sendMessage(
+        chatId,
+        "这个资源已经被另一条消息处理了。",
+        {},
+        env
+      );
+    }
+
+    return finishSave(
+      userId,
+      chatId,
+      resource,
+      folderId,
+      env
     );
   }
 
-
-  const text =
-    buildArticleCard(
-      feed,
-      item
-    );
-
-
-  const keyboard = [];
-
-
-  if (telegraphUrl) {
-
-    keyboard.push([
-      {
-        text: "📖 阅读全文",
-        url: telegraphUrl
-      }
-    ]);
+  if (data === "noop") {
+    return;
   }
 
-
-  if (item.link) {
-
-    keyboard.push([
-      {
-        text: "🔗 查看原文",
-        url: item.link
-      }
-    ]);
-  }
-
-
-  /*
-   * 如果文章有首图，
-   * 使用图片 + caption。
-   */
   if (
-    item.media?.[0]
+    data.startsWith("folder:")
   ) {
-
-    return sendSingleMedia(
-      OWNER_ID,
-      item.media[0],
-      text,
-      env,
-      keyboard
+    return showFolder(
+      userId,
+      chatId,
+      Number(
+        data.slice(7)
+      ),
+      env
     );
   }
 
-
-  return sendText(
-    OWNER_ID,
-    text,
-    env,
-    keyboard
-  );
-}
-
-
-function buildArticleCard(
-  feed,
-  item
-) {
-
-  let text =
-`<b>📰 ${escapeHtml(
-  feed.title ||
-  "RSS"
-)}</b>
-
-<b>${escapeHtml(
-  item.title ||
-  "无标题"
-)}</b>`;
-
-
-  if (item.author) {
-
-    text +=
-      `\n\n👤 ${escapeHtml(
-        item.author
-      )}`;
-  }
-
-
-  if (item.publishedAt) {
-
-    text +=
-      `\n🕒 ${escapeHtml(
-        formatDate(
-          item.publishedAt
-        )
-      )}`;
-  }
-
-
-  const summary =
-    stripHtml(
-      item.summary ||
-      item.content ||
-      ""
+  if (
+    data.startsWith("file:")
+  ) {
+    return showFile(
+      userId,
+      chatId,
+      Number(
+        data.slice(5)
+      ),
+      env
     );
-
-
-  if (summary) {
-
-    text +=
-      `\n\n${escapeHtml(
-        summary.slice(
-          0,
-          2400
-        )
-      )}`;
   }
 
+  if (
+    data.startsWith(
+      "prevfile:"
+    )
+  ) {
+    return navigateFile(
+      userId,
+      chatId,
+      decodeURIComponent(
+        data.slice(9)
+      ),
+      -1,
+      env
+    );
+  }
 
-  return text.slice(
-    0,
-    CONFIG.MAX_TELEGRAM_TEXT
-  );
-}
+  if (
+    data.startsWith(
+      "nextfile:"
+    )
+  ) {
+    return navigateFile(
+      userId,
+      chatId,
+      decodeURIComponent(
+        data.slice(9)
+      ),
+      1,
+      env
+    );
+  }
 
+  if (
+    data.startsWith(
+      "sendfile:"
+    )
+  ) {
+    return resendFile(
+      userId,
+      chatId,
+      Number(
+        data.slice(9)
+      ),
+      env
+    );
+  }
 
-// ============================================================
-// Telegraph
-// ============================================================
-
-async function createTelegraphArticle(
-  feed,
-  item,
-  env
-) {
-
-  const token =
-    await getTelegraphToken(
+  if (
+    data.startsWith(
+      "customid:"
+    )
+  ) {
+    await setState(
+      userId,
+      `rename_file:${Number(
+        data.slice(9)
+      )}`,
       env
     );
 
+    return sendMessage(
+      chatId,
+      "主人想把它改成什么 ID？\n例如：<code>FGO-攻略-001</code>",
+      {},
+      env
+    );
+  }
 
-  let html =
-    item.content ||
-    item.summary ||
-    "";
-
-
-  /*
-   * RSS 没有全文时，
-   * 尝试抓原网页。
-   */
   if (
-    stripHtml(html).length < 500 &&
-    item.link
+    data.startsWith(
+      "deletefile:"
+    )
   ) {
-
-    try {
-
-      const page =
-        await fetchText(
-          item.link,
-          CONFIG.ARTICLE_TIMEOUT,
-          {
-            Accept:
-              "text/html,application/xhtml+xml,*/*"
-          }
-        );
-
-
-      const extracted =
-        extractArticleBody(
-          page,
-          item.link
-        );
-
-
-      if (extracted) {
-        html = extracted;
-      }
-
-    } catch (error) {
-
-      console.error(
-        "ARTICLE FETCH",
-        error
+    const id =
+      Number(
+        data.slice(11)
       );
-    }
-  }
 
+    await env.DB.prepare(`
+      DELETE FROM files
+      WHERE id = ?
+        AND user_id = ?
+    `).bind(
+      id,
+      userId
+    ).run();
 
-  const nodes =
-    htmlToTelegraphNodes(
-      html,
-      item.media,
-      item.link
-    );
-
-
-  if (!nodes.length) {
-
-    throw new Error(
-      "文章正文为空"
-    );
-  }
-
-
-  const title =
-    (
-      item.title ||
-      feed.title ||
-      "RSS Article"
-    ).slice(
-      0,
-      256
-    );
-
-
-  const response =
-    await fetch(
-      `${CONFIG.TELEGRAPH_API}/createPage`,
-      {
-        method: "POST",
-
-        headers: {
-          "content-type":
-            "application/x-www-form-urlencoded"
-        },
-
-        body:
-          new URLSearchParams({
-            access_token: token,
-
-            title,
-
-            author_name:
-              item.author ||
-              feed.title ||
-              "RSS Reader",
-
-            content:
-              JSON.stringify(nodes),
-
-            return_content:
-              "false"
-          })
-      }
-    );
-
-
-  const result =
-    await response.json();
-
-
-  if (!result.ok) {
-
-    throw new Error(
-      result.error ||
-      "Telegraph createPage failed"
+    return sendMessage(
+      chatId,
+      "已经帮主人删除这个资源的索引了。\nTelegram 中原文件不会被删除。",
+      {},
+      env
     );
   }
 
+  if (
+    data.startsWith(
+      "move_start:"
+    )
+  ) {
+    return startMove(
+      userId,
+      chatId,
+      Number(
+        data.slice(11)
+      ),
+      env
+    );
+  }
 
-  return (
-    "https://telegra.ph/" +
-    result.result.path
+  if (
+    data.startsWith(
+      "move_browse:"
+    )
+  ) {
+    return showMoveFolders(
+      userId,
+      chatId,
+      Number(
+        data.slice(12)
+      ),
+      env
+    );
+  }
+
+  if (
+    data.startsWith(
+      "move_here:"
+    )
+  ) {
+    return moveHere(
+      userId,
+      chatId,
+      data.slice(10),
+      env
+    );
+  }
+
+  if (
+    data.startsWith(
+      "move_confirm:"
+    )
+  ) {
+    return moveHere(
+      userId,
+      chatId,
+      data.slice(13),
+      env
+    );
+  }
+
+  if (data === "move_cancel") {
+    await clearState(
+      userId,
+      env
+    );
+
+    return sendMessage(
+      chatId,
+      "移动操作已取消。",
+      {},
+      env
+    );
+  }
+}
+
+async function startMove(
+  userId,
+  chatId,
+  fileId,
+  env
+) {
+  if (
+    !(await getFile(
+      userId,
+      fileId,
+      env
+    ))
+  ) {
+    return sendMessage(
+      chatId,
+      "这个资源不存在。",
+      {},
+      env
+    );
+  }
+
+  await setState(
+    userId,
+    `moving:${fileId}`,
+    env
+  );
+
+  return showMoveFolders(
+    userId,
+    chatId,
+    null,
+    env
   );
 }
 
-
-async function getTelegraphToken(
+async function showMoveFolders(
+  userId,
+  chatId,
+  parentId,
   env
 ) {
+  const folders =
+    await queryFolders(
+      userId,
+      parentId,
+      env
+    );
 
-  /*
-   * 推荐在 Worker Secret 中设置：
-   *
-   * TELEGRAPH_ACCESS_TOKEN
-   *
-   * 如果没有设置，
-   * 第一次调用会创建 Telegraph account。
-   */
-  if (
-    env.TELEGRAPH_ACCESS_TOKEN
-  ) {
+  const buttons = [];
 
-    return env.TELEGRAPH_ACCESS_TOKEN;
-  }
-
-
-  const response =
-    await fetch(
-      `${CONFIG.TELEGRAPH_API}/createAccount`,
+  for (const f of folders) {
+    buttons.push([
       {
-        method: "POST",
-
-        headers: {
-          "content-type":
-            "application/x-www-form-urlencoded"
-        },
-
-        body:
-          new URLSearchParams({
-            short_name:
-              "PrivateRSSReader",
-
-            author_name:
-              "RSS Reader"
-          })
+        text: `📥 ${f.name}`,
+        callback_data:
+          `move_here:${f.id}`
+      },
+      {
+        text: "📂 进入",
+        callback_data:
+          `move_browse:${f.id}`
       }
-    );
-
-
-  const result =
-    await response.json();
-
-
-  if (!result.ok) {
-
-    throw new Error(
-      result.error ||
-      "Telegraph account creation failed"
-    );
+    ]);
   }
 
-
-  return result.result.access_token;
-}
-
-
-// ============================================================
-// Article HTML
-// ============================================================
-
-function extractArticleBody(
-  html,
-  baseUrl
-) {
-
-  let clean =
-    cleanArticleHtml(
-      html
-    );
-
-
-  const candidates = [
-    ...clean.matchAll(
-      /<(article|main)\b[^>]*>([\s\S]*?)<\/\1>/gi
-    )
-  ]
-    .map(
-      match =>
-        match[2]
-    );
-
-
-  let body =
-    candidates.sort(
-      (a, b) =>
-        stripHtml(b).length -
-        stripHtml(a).length
-    )[0] || "";
-
-
-  if (!body) {
-
-    const paragraphs = [
-      ...clean.matchAll(
-        /<p\b[^>]*>[\s\S]*?<\/p>/gi
-      )
-    ]
-      .map(
-        match =>
-          match[0]
+  if (parentId !== null) {
+    const f =
+      await getFolder(
+        userId,
+        parentId,
+        env
       );
 
-
-    body =
-      paragraphs.join("\n");
-  }
-
-
-  if (!body) {
-    return "";
-  }
-
-
-  body =
-    body.replace(
-      /<img\b[^>]*>/gi,
-      tag => {
-
-        const src =
-          attr(
-            tag,
-            "src"
-          ) ||
-          attr(
-            tag,
-            "data-src"
-          );
-
-
-        if (!src) {
-          return "";
-        }
-
-
-        try {
-
-          return `<img src="${new URL(
-            src,
-            baseUrl
-          ).href}">`;
-
-        } catch {
-
-          return "";
-        }
-      }
-    );
-
-
-  return body;
-}
-
-
-function cleanArticleHtml(
-  html
-) {
-
-  return String(
-    html || ""
-  )
-    .replace(
-      /<script[\s\S]*?<\/script>/gi,
-      ""
-    )
-    .replace(
-      /<style[\s\S]*?<\/style>/gi,
-      ""
-    )
-    .replace(
-      /<(nav|footer|header|aside|form)[^>]*>[\s\S]*?<\/\1>/gi,
-      ""
-    )
-    .replace(
-      /\son[a-z]+\s*=\s*(["']).*?\1/gi,
-      ""
-    )
-    .slice(
-      0,
-      CONFIG.MAX_ARTICLE_LENGTH
-    );
-}
-
-
-function htmlToTelegraphNodes(
-  html,
-  media = [],
-  baseUrl = ""
-) {
-
-  let clean =
-    cleanArticleHtml(
-      html
-    );
-
-
-  clean =
-    clean.replace(
-      /<img\b[^>]*>/gi,
-      tag => {
-
-        const src =
-          attr(
-            tag,
-            "src"
-          ) ||
-          attr(
-            tag,
-            "data-src"
-          );
-
-
-        if (!src) {
-          return "";
-        }
-
-
-        try {
-
-          return `<img src="${new URL(
-            src,
-            baseUrl || undefined
-          ).href}">`;
-
-        } catch {
-
-          return "";
-        }
-      }
-    );
-
-
-  const nodes = [];
-
-
-  const regex =
-    /<(h[1-6]|p|blockquote|pre|ul|ol|li)\b[^>]*>([\s\S]*?)<\/\1>|<img\b[^>]*>|<br\s*\/?>/gi;
-
-
-  let match;
-
-  let count = 0;
-
-
-  while (
-    (match = regex.exec(clean)) &&
-    count < 250
-  ) {
-
-    const whole =
-      match[0];
-
-
-    const tag =
-      (
-        match[1] ||
-        (
-          /^<img/i.test(whole)
-            ? "img"
-            : "br"
-        )
-      ).toLowerCase();
-
-
-    if (tag === "img") {
-
-      const src =
-        attr(
-          whole,
-          "src"
-        );
-
-
-      if (
-        isHttpUrl(src)
-      ) {
-
-        nodes.push({
-          tag: "img",
-
-          attrs: {
-            src
-          }
-        });
-      }
-
-
-      count++;
-
-      continue;
-    }
-
-
-    if (tag === "br") {
-
-      nodes.push({
-        tag: "br"
-      });
-
-
-      count++;
-
-      continue;
-    }
-
-
-    const inner =
-      match[2] || "";
-
-
-    const text =
-      stripHtml(
-        inner
-      );
-
-
-    if (!text) {
-      continue;
-    }
-
-
-    if (tag === "pre") {
-
-      nodes.push({
-        tag: "pre",
-
-        children: [
-          {
-            tag: "code",
-
-            children: [
-              text.slice(
-                0,
-                10000
-              )
-            ]
-          }
-        ]
-      });
-
-    } else if (
-      tag === "blockquote"
-    ) {
-
-      nodes.push({
-        tag: "blockquote",
-
-        children: [
-          text.slice(
-            0,
-            5000
-          )
-        ]
-      });
-
-    } else if (
-      tag === "ul" ||
-      tag === "ol"
-    ) {
-
-      nodes.push({
-        tag,
-
-        children: [
-          {
-            tag: "li",
-
-            children: [
-              text.slice(
-                0,
-                5000
-              )
-            ]
-          }
-        ]
-      });
-
-    } else {
-
-      nodes.push({
-        tag,
-
-        children: [
-          text.slice(
-            0,
-            10000
-          )
-        ]
-      });
-    }
-
-
-    count++;
-  }
-
-
-  if (!nodes.length) {
-
-    const text =
-      stripHtml(
-        clean
-      ).slice(
-        0,
-        CONFIG.MAX_ARTICLE_LENGTH
-      );
-
-
-    if (text) {
-
-      return [
+    if (f?.parent_id !== null) {
+      buttons.push([
         {
-          tag: "p",
-          children: [
-            text
-          ]
+          text: "⬆️ 上一级",
+          callback_data:
+            `move_browse:${f.parent_id}`
         }
-      ];
+      ]);
     }
+
+    buttons.push([
+      {
+        text: "📥 就移到这里",
+        callback_data:
+          `move_confirm:${parentId}`
+      }
+    ]);
   }
 
+  buttons.push([
+    {
+      text: "📥 移到根目录",
+      callback_data:
+        "move_here:root"
+    },
+    {
+      text: "取消",
+      callback_data:
+        "move_cancel"
+    }
+  ]);
 
-  return nodes;
+  return sendMessage(
+    chatId,
+    "请选择目标文件夹：",
+    {
+      reply_markup: {
+        inline_keyboard:
+          buttons
+      }
+    },
+    env
+  );
 }
 
-
-// ============================================================
-// RSS Parser
-// ============================================================
-
-function parseFeed(
-  xml,
-  sourceUrl
-) {
-
-  const isAtom =
-    /<feed\b/i.test(xml) &&
-    /<entry\b/i.test(xml);
-
-
-  const title =
-    decodeXml(
-      firstTag(
-        xml,
-        "title"
-      )
-    ).trim();
-
-
-  const description =
-    decodeXml(
-      firstTag(
-        xml,
-        isAtom
-          ? "subtitle"
-          : "description"
-      )
-    ).trim();
-
-
-  const siteUrl =
-    isAtom
-      ? (
-          firstLink(xml) ||
-          sourceUrl
-        )
-      : (
-          decodeXml(
-            firstTag(
-              xml,
-              "link"
-            )
-          ).trim() ||
-          sourceUrl
-        );
-
-
-  const blocks =
-    extractBlocks(
-      xml,
-      isAtom
-        ? "entry"
-        : "item"
-    );
-
-
-  const items =
-    blocks
-      .map(
-        block =>
-          parseEntry(
-            block,
-            isAtom
-          )
-      )
-      .filter(
-        item =>
-          item.title ||
-          item.link ||
-          item.content
-      );
-
-
-  return {
-    title,
-    description,
-    siteUrl,
-    items
-  };
-}
-
-
-function parseEntry(
-  block,
-  isAtom
-) {
-
-  const title =
-    decodeXml(
-      stripHtml(
-        firstTag(
-          block,
-          "title"
-        )
-      )
-    ).trim();
-
-
-  const guid =
-    decodeXml(
-      (
-        isAtom
-          ? firstTag(
-              block,
-              "id"
-            )
-          : firstTag(
-              block,
-              "guid"
-            )
-      ) || ""
-    ).trim();
-
-
-  const link =
-    isAtom
-      ? (
-          firstLink(block) ||
-          ""
-        )
-      : decodeXml(
-          firstTag(
-            block,
-            "link"
-          )
-        ).trim();
-
-
-  const summary =
-    decodeXml(
-      firstTag(
-        block,
-        isAtom
-          ? "summary"
-          : "description"
-      )
-    ).trim();
-
-
-  const content =
-    decodeXml(
-      firstTag(
-        block,
-        isAtom
-          ? "content"
-          : "content:encoded"
-      ) ||
-      summary
-    ).trim();
-
-
-  const author =
-    decodeXml(
-      firstTag(
-        block,
-        "name"
-      ) ||
-      firstTag(
-        block,
-        "dc:creator"
-      ) ||
-      ""
-    ).trim();
-
-
-  const publishedRaw =
-    firstTag(
-      block,
-      isAtom
-        ? "published"
-        : "pubDate"
-    ) ||
-    firstTag(
-      block,
-      "updated"
-    ) ||
-    firstTag(
-      block,
-      "dc:date"
-    ) ||
-    "";
-
-
-  const publishedAt =
-    toIso(
-      publishedRaw
-    );
-
-
-  const media = [];
-
-
-  // RSS enclosure
-  for (
-    const match of block.matchAll(
-      /<enclosure\b[^>]*>/gi
-    )
-  ) {
-
-    const tag =
-      match[0];
-
-
-    const url =
-      attr(
-        tag,
-        "url"
-      );
-
-
-    const type =
-      attr(
-        tag,
-        "type"
-      );
-
-
-    if (
-      isHttpUrl(url)
-    ) {
-
-      media.push({
-        url,
-        type:
-          mediaType(
-            type,
-            url
-          )
-      });
-    }
-  }
-
-
-  // media:content
-  for (
-    const match of block.matchAll(
-      /<(media:content|media:thumbnail)\b[^>]*>/gi
-    )
-  ) {
-
-    const tag =
-      match[0];
-
-
-    const url =
-      attr(
-        tag,
-        "url"
-      );
-
-
-    const type =
-      attr(
-        tag,
-        "type"
-      );
-
-
-    if (
-      isHttpUrl(url) &&
-      !media.some(
-        x =>
-          x.url === url
-      )
-    ) {
-
-      media.push({
-        url,
-        type:
-          mediaType(
-            type,
-            url
-          )
-      });
-    }
-  }
-
-
-  // 图片
-  for (
-    const match of content.matchAll(
-      /<img\b[^>]*>/gi
-    )
-  ) {
-
-    const tag =
-      match[0];
-
-
-    const url =
-      attr(
-        tag,
-        "src"
-      ) ||
-      attr(
-        tag,
-        "data-src"
-      );
-
-
-    if (
-      isHttpUrl(url) &&
-      !media.some(
-        x =>
-          x.url === url
-      )
-    ) {
-
-      media.push({
-        url,
-        type: "photo"
-      });
-    }
-  }
-
-
-  return {
-    title,
-    guid,
-    link,
-    summary,
-    content,
-    author,
-    publishedAt,
-    media:
-      media.slice(
-        0,
-        30
-      )
-  };
-}
-
-
-// ============================================================
-// RSSHub
-// ============================================================
-
-async function rewriteRSSHubUrl(
-  url,
+async function moveHere(
+  userId,
+  chatId,
+  target,
   env
 ) {
-
-  const settings =
-    await getSettings(
-      env,
-      OWNER_ID
+  const state =
+    await getState(
+      userId,
+      env
     );
 
-
-  const instance =
-    normalizeBaseUrl(
-      settings.rsshub_instance ||
-      CONFIG.DEFAULT_RSSHUB
+  if (
+    !state?.startsWith(
+      "moving:"
+    )
+  ) {
+    return sendMessage(
+      chatId,
+      "移动操作已失效，请重新选择。",
+      {},
+      env
     );
-
-
-  if (!instance) {
-    return url;
   }
 
+  const fileId =
+    Number(
+      state.slice(7)
+    );
 
-  try {
+  const folderId =
+    target === "root"
+      ? null
+      : Number(target);
 
-    const parsed =
-      new URL(url);
+  if (
+    folderId !== null &&
+    !(await getFolder(
+      userId,
+      folderId,
+      env
+    ))
+  ) {
+    return sendMessage(
+      chatId,
+      "这个文件夹已经不存在了。",
+      {},
+      env
+    );
+  }
 
+  await env.DB.prepare(`
+    UPDATE files
+    SET folder_id = ?
+    WHERE id = ?
+      AND user_id = ?
+  `).bind(
+    folderId,
+    fileId,
+    userId
+  ).run();
 
-    const defaultHub =
-      new URL(
-        CONFIG.DEFAULT_RSSHUB
+  await clearState(
+    userId,
+    env
+  );
+
+  const file =
+    await getFile(
+      userId,
+      fileId,
+      env
+    );
+
+  const path =
+    folderId
+      ? await getFolderPath(
+          userId,
+          folderId,
+          env
+        )
+      : "根目录";
+
+  return sendMessage(
+    chatId,
+    `好的，主人。\n\n` +
+      `📄 ${escapeHtml(
+        file?.file_name ||
+        "资源"
+      )}\n` +
+      `📁 已移动到：<code>${escapeHtml(
+        path
+      )}</code>`,
+    {},
+    env
+  );
+}
+
+/* -------------------- Save / duplicate / IDs -------------------- */
+
+async function saveResource(
+  userId,
+  resource,
+  folderId,
+  env
+) {
+  const prepared =
+    await prepareSave(
+      userId,
+      resource,
+      folderId,
+      env
+    );
+
+  await env.DB.batch([
+    prepared.statement
+  ]);
+
+  return prepared.result;
+}
+
+async function prepareSave(
+  userId,
+  resource,
+  folderId,
+  env
+) {
+  const folder =
+    await getFolder(
+      userId,
+      folderId,
+      env
+    );
+
+  if (!folder) {
+    throw new Error(
+      "Folder not found"
+    );
+  }
+
+  let stored;
+  let fileUniqueId;
+  let fileName;
+  let fileSize = null;
+  let mimeType;
+
+  const type =
+    resource.type;
+
+  let photoCount = 0;
+  let videoCount = 0;
+  let documentCount = 0;
+
+  if (resource.type === "file") {
+    fileUniqueId =
+      resource.fileUniqueId ||
+      `file:${resource.fileId}`;
+
+    fileName =
+      deriveName(resource);
+
+    fileSize =
+      resource.fileSize;
+
+    mimeType =
+      resource.mimeType;
+  } else if (
+    resource.type ===
+    "media_group"
+  ) {
+    resource.items =
+      uniqueBy(
+        resource.items,
+        x =>
+          x.fileUniqueId ||
+          x.messageId
       );
 
+    resource.items.sort(
+      (a, b) =>
+        Number(a.messageId) -
+        Number(b.messageId)
+    );
 
-    if (
-      parsed.origin ===
-      defaultHub.origin
-    ) {
+    photoCount =
+      resource.items.filter(
+        x =>
+          x.kind === "photo"
+      ).length;
 
-      return (
-        instance +
-        parsed.pathname +
-        parsed.search
+    videoCount =
+      resource.items.filter(
+        x =>
+          x.kind === "video"
+      ).length;
+
+    documentCount =
+      resource.items.filter(
+        x =>
+          x.kind === "document"
+      ).length;
+
+    fileUniqueId =
+      "media_group:" +
+      resource.items
+        .map(
+          x =>
+            x.fileUniqueId ||
+            x.fileId
+        )
+        .sort()
+        .join("|");
+
+    stored =
+      JSON.stringify({
+        type: "media_group",
+        mediaGroupId:
+          resource.mediaGroupId,
+        items:
+          resource.items,
+        createdAt:
+          resource.createdAt ||
+          Date.now()
+      });
+
+    mimeType =
+      "media/media_group";
+
+    fileSize =
+      resource.items.reduce(
+        (s, x) =>
+          s +
+          Number(
+            x.fileSize || 0
+          ),
+        0
+      ) || null;
+
+    fileName =
+      deriveName(resource);
+  } else if (
+    resource.type === "link"
+  ) {
+    fileUniqueId =
+      `link:${
+        resource.messageId ||
+        Date.now()
+      }`;
+
+    stored =
+      JSON.stringify(resource);
+
+    mimeType =
+      "text/link";
+
+    fileName =
+      deriveName(resource);
+  } else {
+    throw new Error(
+      "Unknown resource type"
+    );
+  }
+
+  const dup =
+    await env.DB.prepare(`
+      SELECT id, custom_id
+      FROM files
+      WHERE user_id = ?
+        AND file_unique_id = ?
+      LIMIT 1
+    `).bind(
+      userId,
+      fileUniqueId
+    ).first();
+
+  if (dup) {
+    const e =
+      new Error("DUPLICATE");
+
+    e.code = "DUPLICATE";
+
+    throw e;
+  }
+
+  const customId =
+    await generateCustomId(
+      userId,
+      folder.id,
+      folder.name,
+      env
+    );
+
+  const fileId =
+    resource.type === "file"
+      ? resource.fileId
+      : stored;
+
+  const statement =
+    env.DB.prepare(`
+      INSERT INTO files(
+        user_id,
+        file_id,
+        file_unique_id,
+        file_name,
+        file_size,
+        mime_type,
+        custom_id,
+        folder_id
+      )
+      VALUES(?,?,?,?,?,?,?,?)
+    `).bind(
+      userId,
+      fileId,
+      fileUniqueId,
+      fileName,
+      fileSize,
+      mimeType,
+      customId,
+      folderId
+    );
+
+  const result = {
+    type,
+    fileName,
+    customId,
+    folderPath:
+      await getFolderPath(
+        userId,
+        folder.id,
+        env
+      ),
+    count:
+      resource.items?.length,
+    photoCount,
+    videoCount,
+    documentCount
+  };
+
+  return {
+    statement,
+    result
+  };
+}
+
+async function generateCustomId(
+  userId,
+  folderId,
+  folderName,
+  env
+) {
+  const prefix =
+    cleanIdPrefix(
+      folderName
+    );
+
+  const r =
+    await env.DB.prepare(`
+      SELECT custom_id
+      FROM files
+      WHERE user_id = ?
+        AND folder_id = ?
+    `).bind(
+      userId,
+      folderId
+    ).all();
+
+  let max = 0;
+
+  for (
+    const x of
+    r.results || []
+  ) {
+    const m =
+      String(
+        x.custom_id || ""
+      ).match(
+        new RegExp(
+          "^" +
+          escapeRegExp(prefix) +
+          "-(\\d+)$"
+        )
       );
+
+    if (m) {
+      max =
+        Math.max(
+          max,
+          Number(m[1])
+        );
     }
+  }
 
+  return (
+    `${prefix}-` +
+    String(max + 1)
+      .padStart(3, "0")
+  );
+}
 
-    return url;
+async function sendSavedMessage(
+  chatId,
+  result,
+  env
+) {
+  if (
+    result.type ===
+    "media_group"
+  ) {
+    return sendMessage(
+      chatId,
+      `整理好了，主人。\n\n` +
+        `📦 <b>${escapeHtml(
+          result.fileName
+        )}</b>\n` +
+        `媒体数量：${result.count}\n` +
+        `📁 <code>${escapeHtml(
+          result.folderPath
+        )}</code>\n` +
+        `🆔 <code>${escapeHtml(
+          result.customId
+        )}</code>`,
+      {},
+      env
+    );
+  }
 
-  } catch {
+  if (
+    result.type === "link"
+  ) {
+    return sendMessage(
+      chatId,
+      `整理好了，主人。\n\n` +
+        `🔗 <b>${escapeHtml(
+          result.fileName
+        )}</b>\n` +
+        `📁 <code>${escapeHtml(
+          result.folderPath
+        )}</code>\n` +
+        `🆔 <code>${escapeHtml(
+          result.customId
+        )}</code>`,
+      {},
+      env
+    );
+  }
 
-    return url;
+  return sendMessage(
+    chatId,
+    `整理好了，主人。\n\n` +
+      `📄 <b>${escapeHtml(
+        result.fileName
+      )}</b>\n` +
+      `📁 <code>${escapeHtml(
+        result.folderPath
+      )}</code>\n` +
+      `🆔 <code>${escapeHtml(
+        result.customId
+      )}</code>`,
+    {},
+    env
+  );
+}
+
+async function showBatchProgress(
+  userId,
+  chatId,
+  result,
+  env
+) {
+  const r =
+    await getStateRecord(
+      userId,
+      env
+    );
+
+  const n =
+    Number(
+      r?.batch_done || 0
+    ) + 1;
+
+  const frames = [
+    "▓░░░░░",
+    "▓▓░░░░",
+    "▓▓▓░░░",
+    "▓▓▓▓░░",
+    "▓▓▓▓▓░",
+    "▓▓▓▓▓▓"
+  ];
+
+  const bar =
+    frames[
+      (n - 1) %
+      frames.length
+    ];
+
+  const text =
+    `⏳ 正在连续归档\n` +
+    `${bar} 已处理 ${n} 个\n\n` +
+    `📄 ${escapeHtml(
+      result.fileName
+    )}`;
+
+  if (r?.progress_message_id) {
+    await telegram(
+      "editMessageText",
+      {
+        chat_id: chatId,
+        message_id:
+          Number(
+            r.progress_message_id
+          ),
+        text,
+        parse_mode: "HTML"
+      },
+      env
+    );
+
+    await env.DB.prepare(`
+      UPDATE user_states
+      SET batch_done = ?,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE chat_id = ?
+    `).bind(
+      n,
+      userId
+    ).run();
+  } else {
+    const sent =
+      await sendMessage(
+        chatId,
+        text,
+        {},
+        env
+      );
+
+    const mid =
+      sent?.result?.message_id;
+
+    await env.DB.prepare(`
+      UPDATE user_states
+      SET progress_message_id = ?,
+          batch_done = ?,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE chat_id = ?
+    `).bind(
+      mid,
+      n,
+      userId
+    ).run();
   }
 }
 
+/* -------------------- Folder views -------------------- */
 
-// ============================================================
-// Database Helpers
-// ============================================================
+async function queryFolders(
+  userId,
+  parentId,
+  env
+) {
+  if (parentId === null) {
+    return (
+      await env.DB.prepare(`
+        SELECT id,name,parent_id
+        FROM folders
+        WHERE user_id = ?
+          AND parent_id IS NULL
+        ORDER BY name
+      `).bind(
+        userId
+      ).all()
+    ).results || [];
+  }
 
-async function getFeed(
+  return (
+    await env.DB.prepare(`
+      SELECT id,name,parent_id
+      FROM folders
+      WHERE user_id = ?
+        AND parent_id = ?
+      ORDER BY name
+    `).bind(
+      userId,
+      parentId
+    ).all()
+  ).results || [];
+}
+
+async function showFolderRoot(
+  userId,
+  chatId,
+  env
+) {
+  const folders =
+    await queryFolders(
+      userId,
+      null,
+      env
+    );
+
+  const buttons =
+    folders.map(
+      f => [
+        {
+          text:
+            `📁 ${f.name}`,
+          callback_data:
+            `folder:${f.id}`
+        }
+      ]
+    );
+
+  return sendMessage(
+    chatId,
+    "主人，这是文件库的根目录：",
+    {
+      reply_markup: {
+        inline_keyboard:
+          buttons
+      }
+    },
+    env
+  );
+}
+
+async function showFolder(
+  userId,
+  chatId,
+  folderId,
+  env
+) {
+  const folder =
+    await getFolder(
+      userId,
+      folderId,
+      env
+    );
+
+  if (!folder) {
+    return sendMessage(
+      chatId,
+      "这个文件夹已经不存在了。",
+      {},
+      env
+    );
+  }
+
+  const subs =
+    await queryFolders(
+      userId,
+      folderId,
+      env
+    );
+
+  const files =
+    (
+      await env.DB.prepare(`
+        SELECT id,file_name,custom_id,mime_type
+        FROM files
+        WHERE user_id = ?
+          AND folder_id = ?
+        ORDER BY created_at DESC
+      `).bind(
+        userId,
+        folderId
+      ).all()
+    ).results || [];
+
+  const buttons = [];
+
+  for (const f of subs) {
+    buttons.push([
+      {
+        text:
+          `📁 ${f.name}`,
+        callback_data:
+          `folder:${f.id}`
+      }
+    ]);
+  }
+
+  for (const f of files) {
+    buttons.push([
+      {
+        text:
+          `${getResourceIcon(
+            f.mime_type
+          )} ` +
+          `${f.custom_id || "无ID"} · ` +
+          `${truncate(
+            f.file_name,
+            22
+          )}`,
+        callback_data:
+          `file:${f.id}`
+      }
+    ]);
+  }
+
+  if (
+    folder.parent_id !== null
+  ) {
+    buttons.push([
+      {
+        text: "⬆️ 上一级",
+        callback_data:
+          `folder:${folder.parent_id}`
+      }
+    ]);
+  }
+
+  const path =
+    await getFolderPath(
+      userId,
+      folderId,
+      env
+    );
+
+  return sendMessage(
+    chatId,
+    `📁 <b>${escapeHtml(
+      folder.name
+    )}</b>\n\n` +
+      `路径：<code>${escapeHtml(
+        path
+      )}</code>\n\n` +
+      `📁 子文件夹：${subs.length}\n` +
+      `📦 资源：${files.length}`,
+    {
+      reply_markup: {
+        inline_keyboard:
+          buttons
+      }
+    },
+    env
+  );
+}
+
+async function showRecentFiles(
+  userId,
+  chatId,
+  env
+) {
+  const files =
+    (
+      await env.DB.prepare(`
+        SELECT id,file_name,custom_id,mime_type
+        FROM files
+        WHERE user_id = ?
+        ORDER BY created_at DESC
+        LIMIT 30
+      `).bind(
+        userId
+      ).all()
+    ).results || [];
+
+  if (!files.length) {
+    return sendMessage(
+      chatId,
+      "主人，目前还没有资源。",
+      {},
+      env
+    );
+  }
+
+  const buttons =
+    files.map(
+      f => [
+        {
+          text:
+            `${getResourceIcon(
+              f.mime_type
+            )} ` +
+            `${f.custom_id || "无ID"} · ` +
+            `${truncate(
+              f.file_name,
+              20
+            )}`,
+          callback_data:
+            `file:${f.id}`
+        }
+      ]
+    );
+
+  return sendMessage(
+    chatId,
+    `📄 <b>最近的资源</b>\n` +
+      `显示最近整理的 ${files.length} 个资源。`,
+    {
+      reply_markup: {
+        inline_keyboard:
+          buttons
+      }
+    },
+    env
+  );
+}
+
+async function showFile(
+  userId,
+  chatId,
   id,
   env
 ) {
-
-  return env.DB.prepare(`
-    SELECT *
-    FROM feeds
-    WHERE id=?
-  `)
-    .bind(id)
-    .first();
-}
-
-
-async function getSettings(
-  env,
-  userId
-) {
-
-  let row =
-    await env.DB.prepare(`
-      SELECT *
-      FROM user_settings
-      WHERE user_id=?
-    `)
-      .bind(userId)
-      .first();
-
-
-  if (!row) {
-
-    await env.DB.prepare(`
-      INSERT OR IGNORE INTO user_settings
-      (
-        user_id,
-        rsshub_instance,
-        language
-      )
-      VALUES (?, ?, ?)
-    `)
-      .bind(
-        userId,
-        CONFIG.DEFAULT_RSSHUB,
-        "zh-CN"
-      )
-      .run();
-
-
-    row =
-      await env.DB.prepare(`
-        SELECT *
-        FROM user_settings
-        WHERE user_id=?
-      `)
-        .bind(userId)
-        .first();
-  }
-
-
-  return row;
-}
-
-
-async function setState(
-  env,
-  userId,
-  state
-) {
-
-  await env.DB.prepare(`
-    INSERT INTO user_states
-    (
-      user_id,
-      state_json,
-      updated_at
-    )
-    VALUES (?, ?, ?)
-
-    ON CONFLICT(user_id)
-    DO UPDATE SET
-      state_json=excluded.state_json,
-      updated_at=excluded.updated_at
-  `)
-    .bind(
+  const f =
+    await getFile(
       userId,
-      JSON.stringify(state),
-      now()
-    )
-    .run();
-}
-
-
-async function getState(
-  env,
-  userId
-) {
-
-  const row =
-    await env.DB.prepare(`
-      SELECT state_json
-      FROM user_states
-      WHERE user_id=?
-    `)
-      .bind(userId)
-      .first();
-
-
-  if (!row) {
-    return null;
-  }
-
-
-  try {
-
-    return JSON.parse(
-      row.state_json
+      id,
+      env
     );
 
-  } catch {
-
-    return null;
-  }
-}
-
-
-async function clearState(
-  env,
-  userId
-) {
-
-  await env.DB.prepare(`
-    DELETE FROM user_states
-    WHERE user_id=?
-  `)
-    .bind(userId)
-    .run();
-}
-
-
-async function seedEntry(
-  env,
-  feedId,
-  item,
-  id = entryStableId(
-    feedId,
-    item
-  )
-) {
-
-  await env.DB.prepare(`
-    INSERT OR IGNORE INTO feed_entries
-    (
-      id,
-      feed_id,
-      guid,
-      url,
-      title,
-      summary,
-      content,
-      published_at,
-      content_hash,
-      discovered_at
-    )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `)
-    .bind(
-      id,
-      feedId,
-      item.guid ||
-        item.link ||
-        item.title ||
-        crypto.randomUUID(),
-
-      item.link ||
-        "",
-
-      item.title ||
-        "",
-
-      item.summary ||
-        "",
-
-      item.content ||
-        "",
-
-      item.publishedAt ||
-        now(),
-
-      hashString(
-        item.guid ||
-        item.link ||
-        item.title ||
-        item.content ||
-        ""
-      ),
-
-      now()
-    )
-    .run();
-}
-
-
-function entryStableId(
-  feedId,
-  item
-) {
-
-  return hashString(
-    `${feedId}|${
-      item.guid ||
-      item.link ||
-      item.title ||
-      hashString(
-        item.content ||
-        ""
-      )
-    }`
-  );
-}
-
-
-// ============================================================
-// Telegram Helpers
-// ============================================================
-
-async function sendText(
-  chatId,
-  text,
-  env,
-  keyboard
-) {
-
-  const payload = {
-
-    chat_id:
+  if (!f) {
+    return sendMessage(
       chatId,
-
-    text:
-      text ||
-      "\u200b",
-
-    parse_mode:
-      "HTML",
-
-    disable_web_page_preview:
-      true,
-
-  };
-
-
-  if (keyboard) {
-
-    payload.reply_markup =
-      JSON.stringify({
-        inline_keyboard:
-          keyboard
-      });
+      "这个资源已经不存在了。",
+      {},
+      env
+    );
   }
 
-
-  return tg(
-    "sendMessage",
-    payload,
+  return renderFile(
+    userId,
+    chatId,
+    f,
     env
   );
 }
 
-
-async function editMessage(
+/*
+ * 文件详情页。
+ *
+ * 注意：
+ * 这里故意不再放「上一个 / 下一个」。
+ * 导航按钮会在实际取出的资源下面显示。
+ */
+async function renderFile(
+  userId,
   chatId,
-  messageId,
-  text,
-  keyboard,
+  f,
   env
 ) {
+  const path =
+    f.folder_id
+      ? await getFolderPath(
+          userId,
+          f.folder_id,
+          env
+        )
+      : "根目录";
 
-  if (!messageId) {
+  const size =
+    f.file_size
+      ? formatFileSize(
+          f.file_size
+        )
+      : "未知";
 
-    return sendText(
-      chatId,
-      text,
-      env,
-      keyboard?.inline_keyboard
-    );
+  const buttons = [];
+
+  buttons.push([
+    {
+      text: "📤 取出资源",
+      callback_data:
+        `sendfile:${f.id}`
+    }
+  ]);
+
+  buttons.push([
+    {
+      text: "🆔 修改 ID",
+      callback_data:
+        `customid:${f.id}`
+    }
+  ]);
+
+  buttons.push([
+    {
+      text: "🗑 删除索引",
+      callback_data:
+        `deletefile:${f.id}`
+    }
+  ]);
+
+  buttons.push([
+    {
+      text: "📂 移动到...",
+      callback_data:
+        `move_start:${f.id}`
+    }
+  ]);
+
+  if (f.folder_id) {
+    buttons.push([
+      {
+        text: "⬆️ 返回文件夹",
+        callback_data:
+          `folder:${f.folder_id}`
+      }
+    ]);
   }
 
-
-  return tg(
-    "editMessageText",
+  return sendMessage(
+    chatId,
+    `${getResourceIcon(
+      f.mime_type
+    )} ` +
+      `<b>${escapeHtml(
+        f.file_name
+      )}</b>\n\n` +
+      `🆔 ID：<code>${escapeHtml(
+        f.custom_id || "无"
+      )}</code>\n` +
+      `📁 路径：<code>${escapeHtml(
+        path
+      )}</code>\n` +
+      `📦 大小：${size}\n` +
+      `🗂 类型：${escapeHtml(
+        f.mime_type || "未知"
+      )}`,
     {
-      chat_id:
-        chatId,
-
-      message_id:
-        messageId,
-
-      text,
-
-      parse_mode:
-        "HTML",
-
-      disable_web_page_preview:
-        true,
-
-      reply_markup:
-        keyboard
-          ? JSON.stringify(
-              keyboard
-            )
-          : undefined
+      reply_markup: {
+        inline_keyboard:
+          buttons
+      }
     },
     env
   );
 }
 
+/*
+ * 实际取出资源后的导航按钮。
+ *
+ * 这里根据当前 custom_id 找前后两个文件。
+ *
+ * 如果没有上一项/下一项，则使用 noop，
+ * 这样按钮仍保持在原位置。
+ */
+function buildFileNavigationButtons(
+  prev,
+  next
+) {
+  if (!prev && !next) {
+    return null;
+  }
 
-async function editOrSend(
+  return {
+    inline_keyboard: [
+      [
+        {
+          text: "⬅️ 上一个",
+          callback_data:
+            prev
+              ? `prevfile:${encodeURIComponent(
+                  prev.custom_id
+                )}`
+              : "noop"
+        },
+        {
+          text: "➡️ 下一个",
+          callback_data:
+            next
+              ? `nextfile:${encodeURIComponent(
+                  next.custom_id
+                )}`
+              : "noop"
+        }
+      ]
+    ]
+  };
+}
+
+/*
+ * 点击「上一个 / 下一个」以后，
+ * 不再打开文件详情页。
+ *
+ * 而是直接把相邻资源取出来。
+ */
+async function navigateFile(
+  userId,
   chatId,
-  messageId,
-  text,
-  keyboard,
+  customId,
+  dir,
   env
 ) {
+  const cur =
+    await env.DB.prepare(`
+      SELECT id,custom_id
+      FROM files
+      WHERE user_id = ?
+        AND custom_id = ?
+      LIMIT 1
+    `).bind(
+      userId,
+      customId
+    ).first();
 
-  if (messageId) {
-
-    return editMessage(
+  if (!cur) {
+    return sendMessage(
       chatId,
-      messageId,
-      text,
-      keyboard,
+      "这个 ID 已不存在。",
+      {},
       env
     );
   }
 
+  const n =
+    await adjacentFile(
+      userId,
+      customId,
+      dir,
+      env
+    );
 
-  return sendText(
+  if (!n) {
+    return sendMessage(
+      chatId,
+      dir < 0
+        ? "已经是第一项了。"
+        : "已经是最后一项了。",
+      {},
+      env
+    );
+  }
+
+  /*
+   * 关键修改：
+   *
+   * 原来这里是 renderFile()，
+   * 现在直接 resendFile()。
+   */
+  return resendFile(
+    userId,
     chatId,
-    text,
-    env,
-    keyboard?.inline_keyboard
+    n.id,
+    env
   );
 }
 
-
-async function tg(
-  method,
-  payload,
+async function adjacentFile(
+  userId,
+  customId,
+  dir,
   env
 ) {
+  const op =
+    dir < 0 ? "<" : ">";
 
-  const clean =
-    Object.fromEntries(
-      Object.entries(
-        payload || {}
-      )
-        .filter(
-          ([, value]) =>
-            value !== undefined
-        )
-    );
+  const order =
+    dir < 0
+      ? "DESC"
+      : "ASC";
 
-
-  const response =
-    await fetch(
-      `https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`,
-      {
-        method: "POST",
-
-        headers: {
-          "content-type":
-            "application/json"
-        },
-
-        body:
-          JSON.stringify(clean)
-      }
-    );
-
-
-  const result =
-    await response.json();
-
-
-  if (!result.ok) {
-
-    throw new Error(
-      `Telegram ${method}: ${
-        result.description ||
-        "API error"
-      }`
-    );
-  }
-
-
-  return result;
+  return env.DB.prepare(`
+    SELECT id,custom_id
+    FROM files
+    WHERE user_id = ?
+      AND custom_id ${op} ?
+    ORDER BY custom_id ${order}
+    LIMIT 1
+  `).bind(
+    userId,
+    customId
+  ).first();
 }
 
-
-async function tgDocument(
-  chatId,
-  blob,
-  filename,
-  caption,
+async function getFile(
+  userId,
+  id,
   env
 ) {
-
-  const form =
-    new FormData();
-
-
-  form.append(
-    "chat_id",
-    chatId
-  );
-
-
-  form.append(
-    "document",
-    blob,
-    filename
-  );
-
-
-  form.append(
-    "caption",
-    caption
-  );
-
-
-  const response =
-    await fetch(
-      `https://api.telegram.org/bot${env.BOT_TOKEN}/sendDocument`,
-      {
-        method: "POST",
-        body: form
-      }
-    );
-
-
-  const result =
-    await response.json();
-
-
-  if (!result.ok) {
-
-    throw new Error(
-      result.description ||
-      "sendDocument failed"
-    );
-  }
-
-
-  return result;
+  return env.DB.prepare(`
+    SELECT *
+    FROM files
+    WHERE user_id = ?
+      AND id = ?
+    LIMIT 1
+  `).bind(
+    userId,
+    id
+  ).first();
 }
 
-
-// ============================================================
-// HTTP
-// ============================================================
-
-async function fetchText(
-  url,
-  timeout,
-  headers = {}
+async function getFolder(
+  userId,
+  id,
+  env
 ) {
-
-  const controller =
-    new AbortController();
-
-
-  const timer =
-    setTimeout(
-      () =>
-        controller.abort(),
-      timeout
-    );
-
-
-  try {
-
-    const response =
-      await fetch(
-        url,
-        {
-          redirect: "follow",
-
-          signal:
-            controller.signal,
-
-          headers: {
-            "user-agent":
-              CONFIG.USER_AGENT,
-
-            ...headers
-          }
-        }
-      );
-
-
-    if (!response.ok) {
-
-      throw new Error(
-        `HTTP ${response.status}`
-      );
-    }
-
-
-    return await response.text();
-
-  } finally {
-
-    clearTimeout(timer);
-  }
+  return env.DB.prepare(`
+    SELECT id,name,parent_id,created_at
+    FROM folders
+    WHERE user_id = ?
+      AND id = ?
+    LIMIT 1
+  `).bind(
+    userId,
+    id
+  ).first();
 }
 
-
-// ============================================================
-// OPML
-// ============================================================
-
-function parseOPML(
-  xml
+async function getFolderPath(
+  userId,
+  id,
+  env
 ) {
+  const p = [];
 
-  const urls = [];
-
+  let cur = id;
 
   for (
-    const match of
-      xml.matchAll(
-        /<outline\b[^>]*>/gi
-      )
+    let i = 0;
+    cur != null && i < 100;
+    i++
   ) {
-
-    const tag =
-      match[0];
-
-
-    const url =
-      attr(
-        tag,
-        "xmlUrl"
-      ) ||
-      attr(
-        tag,
-        "xmlurl"
+    const f =
+      await getFolder(
+        userId,
+        cur,
+        env
       );
 
+    if (!f) break;
 
-    if (
-      isHttpUrl(url) &&
-      !urls.includes(url)
-    ) {
+    p.unshift(f.name);
 
-      urls.push(url);
+    cur =
+      f.parent_id;
+  }
+
+  return p.join("/");
+}
+
+/* -------------------- Resend -------------------- */
+
+/*
+ * 取出文件。
+ *
+ * 普通文件：
+ * 直接把 Inline Keyboard 放在实际文件消息下面。
+ *
+ * 媒体组：
+ * Telegram sendMediaGroup 不支持 reply_markup，
+ * 所以由 resendMediaGroup 在媒体组发送完成后，
+ * 紧接着发送导航按钮。
+ *
+ * 链接：
+ * 直接把按钮放在链接消息下面。
+ */
+async function resendFile(
+  userId,
+  chatId,
+  id,
+  env
+) {
+  const f =
+    await getFile(
+      userId,
+      id,
+      env
+    );
+
+  if (!f) {
+    return sendMessage(
+      chatId,
+      "这个资源已经不存在了。",
+      {},
+      env
+    );
+  }
+
+  if (
+    f.mime_type ===
+    "media/media_group"
+  ) {
+    return resendMediaGroup(
+      userId,
+      chatId,
+      f,
+      env
+    );
+  }
+
+  if (
+    f.mime_type ===
+    "text/link"
+  ) {
+    return resendLink(
+      userId,
+      chatId,
+      f,
+      env
+    );
+  }
+
+  /*
+   * 计算当前文件的前后文件。
+   *
+   * 注意这里使用 custom_id 排序，
+   * 与原来的 adjacentFile() 保持一致。
+   */
+  const prev =
+    await adjacentFile(
+      userId,
+      f.custom_id,
+      -1,
+      env
+    );
+
+  const next =
+    await adjacentFile(
+      userId,
+      f.custom_id,
+      1,
+      env
+    );
+
+  const replyMarkup =
+    buildFileNavigationButtons(
+      prev,
+      next
+    );
+
+  let method =
+    "sendDocument";
+
+  let body = {
+    chat_id: chatId,
+    document: f.file_id,
+    caption:
+      `🆔 ${
+        f.custom_id || ""
+      }\n` +
+      `📄 ${f.file_name}`
+  };
+
+  if (replyMarkup) {
+    body.reply_markup =
+      replyMarkup;
+  }
+
+  if (
+    f.mime_type?.startsWith(
+      "video/"
+    )
+  ) {
+    method =
+      "sendVideo";
+
+    body = {
+      chat_id: chatId,
+      video: f.file_id,
+      caption:
+        `🆔 ${
+          f.custom_id || ""
+        }\n` +
+        `📄 ${f.file_name}`
+    };
+
+    if (replyMarkup) {
+      body.reply_markup =
+        replyMarkup;
+    }
+  } else if (
+    f.mime_type?.startsWith(
+      "audio/"
+    )
+  ) {
+    method =
+      "sendAudio";
+
+    body = {
+      chat_id: chatId,
+      audio: f.file_id,
+      caption:
+        `🆔 ${
+          f.custom_id || ""
+        }\n` +
+        `📄 ${f.file_name}`
+    };
+
+    if (replyMarkup) {
+      body.reply_markup =
+        replyMarkup;
+    }
+  } else if (
+    f.mime_type?.startsWith(
+      "image/"
+    )
+  ) {
+    method =
+      "sendPhoto";
+
+    body = {
+      chat_id: chatId,
+      photo: f.file_id,
+      caption:
+        `🆔 ${
+          f.custom_id || ""
+        }\n` +
+        `📄 ${f.file_name}`
+    };
+
+    if (replyMarkup) {
+      body.reply_markup =
+        replyMarkup;
     }
   }
 
-
-  return urls;
+  return telegram(
+    method,
+    body,
+    env
+  );
 }
 
-
-// ============================================================
-// XML
-// ============================================================
-
-function extractBlocks(
-  xml,
-  tag
+async function resendMediaGroup(
+  userId,
+  chatId,
+  f,
+  env
 ) {
+  let data;
 
-  const regex =
-    new RegExp(
-      `<${tag}\\b[^>]*>[\\s\\S]*?<\\/${tag}>`,
-      "gi"
-    );
-
-
-  return [
-    ...xml.matchAll(regex)
-  ]
-    .map(
-      match =>
-        match[0]
-    );
-}
-
-
-function firstTag(
-  xml,
-  tag
-) {
-
-  const safe =
-    tag.replace(
-      ":",
-      "\\:"
-    );
-
-
-  const regex =
-    new RegExp(
-      `<${safe}\\b[^>]*>([\\s\\S]*?)<\\/${safe}>`,
-      "i"
-    );
-
-
-  const match =
-    xml.match(regex);
-
-
-  return match
-    ? match[1]
-    : "";
-}
-
-
-function firstLink(
-  xml
-) {
-
-  const normal =
-    xml.match(
-      /<link\b([^>]*)>([\s\S]*?)<\/link>/i
-    );
-
-
-  if (normal) {
-
-    const href =
-      attr(
-        normal[0],
-        "href"
+  try {
+    data =
+      JSON.parse(
+        f.file_id
       );
-
-
-    if (href) {
-      return decodeXml(href);
-    }
-
-
-    return decodeXml(
-      normal[2] || ""
-    ).trim();
+  } catch {
+    return sendMessage(
+      chatId,
+      "媒体组数据损坏。",
+      {},
+      env
+    );
   }
 
+  const media =
+    (data.items || [])
+      .map(x => {
+        const type =
+          x.kind === "photo"
+            ? "photo"
+            : x.kind === "video"
+              ? "video"
+              : "document";
 
-  const self =
-    xml.match(
-      /<link\b([^>]*)\/?>/i
+        const item = {
+          type,
+          media: x.fileId
+        };
+
+        if (x.caption) {
+          item.caption =
+            x.caption;
+        }
+
+        return item;
+      });
+
+  if (!media.length) {
+    return sendMessage(
+      chatId,
+      "这个媒体组没有可取出的内容。",
+      {},
+      env
+    );
+  }
+
+  /*
+   * Telegram Bot API 的 sendMediaGroup
+   * 不能直接设置 reply_markup。
+   *
+   * 所以先完整发送媒体组。
+   */
+  const result =
+    await telegram(
+      "sendMediaGroup",
+      {
+        chat_id: chatId,
+        media
+      },
+      env
     );
 
+  /*
+   * 如果发送失败，就不继续发送导航按钮。
+   */
+  if (!result?.ok) {
+    return result;
+  }
 
-  return self
-    ? decodeXml(
-        attr(
-          self[0],
-          "href"
-        ) || ""
-      )
-    : "";
-}
-
-
-function attr(
-  tag,
-  name
-) {
-
-  const regex =
-    new RegExp(
-      `${name}\\s*=\\s*([\"'])([\\s\\S]*?)\\1`,
-      "i"
+  /*
+   * 找到媒体组前后相邻资源。
+   */
+  const prev =
+    await adjacentFile(
+      userId,
+      f.custom_id,
+      -1,
+      env
     );
 
+  const next =
+    await adjacentFile(
+      userId,
+      f.custom_id,
+      1,
+      env
+    );
 
-  const match =
-    tag.match(regex);
+  const replyMarkup =
+    buildFileNavigationButtons(
+      prev,
+      next
+    );
 
+  /*
+   * 如果存在上一项或下一项，
+   * 紧接着媒体组发送一个导航消息。
+   *
+   * 这样视觉上就是：
+   *
+   * 图片
+   * 图片
+   * 图片
+   * ⬅️ 上一个    ➡️ 下一个
+   */
+  if (replyMarkup) {
+    await sendMessage(
+      chatId,
+      `📦 <b>${escapeHtml(
+        f.file_name
+      )}</b>\n` +
+        `🆔 <code>${escapeHtml(
+          f.custom_id || ""
+        )}</code>`,
+      {
+        reply_markup:
+          replyMarkup
+      },
+      env
+    );
+  }
 
-  return match
-    ? decodeXml(
-        match[2]
-      )
-    : "";
+  return result;
 }
 
-
-function decodeXml(
-  value
+async function resendLink(
+  userId,
+  chatId,
+  f,
+  env
 ) {
+  /*
+   * 链接也需要找到前后文件，
+   * 然后把按钮直接放在链接消息下面。
+   */
+  const prev =
+    await adjacentFile(
+      userId,
+      f.custom_id,
+      -1,
+      env
+    );
 
-  return String(
-    value || ""
-  )
-    .replace(
-      /<!\[CDATA\[([\s\S]*?)\]\]>/g,
-      "$1"
-    )
-    .replace(
-      /&lt;/g,
-      "<"
-    )
-    .replace(
-      /&gt;/g,
-      ">"
-    )
-    .replace(
-      /&quot;/g,
-      '"'
-    )
-    .replace(
-      /&#39;/g,
-      "'"
-    )
-    .replace(
-      /&amp;/g,
-      "&"
-    )
-    .replace(
-      /&#(\d+);/g,
-      (_, n) =>
-        String.fromCodePoint(
-          Number(n)
-        )
-    )
-    .replace(
-      /&#x([0-9a-f]+);/gi,
-      (_, n) =>
-        String.fromCodePoint(
-          parseInt(
-            n,
-            16
+  const next =
+    await adjacentFile(
+      userId,
+      f.custom_id,
+      1,
+      env
+    );
+
+  const replyMarkup =
+    buildFileNavigationButtons(
+      prev,
+      next
+    );
+
+  try {
+    const x =
+      JSON.parse(
+        f.file_id
+      );
+
+    return sendMessage(
+      chatId,
+      x.text ||
+        x.url,
+      {
+        disable_web_page_preview:
+          false,
+        ...(replyMarkup
+          ? {
+              reply_markup:
+                replyMarkup
+            }
+          : {})
+      },
+      env
+    );
+  } catch {
+    return sendMessage(
+      chatId,
+      f.file_name,
+      replyMarkup
+        ? {
+            reply_markup:
+              replyMarkup
+          }
+        : {},
+      env
+    );
+  }
+}
+
+/* -------------------- Inline mode -------------------- */
+
+async function handleInlineQuery(
+  q,
+  env
+) {
+  const userId =
+    String(q.from.id);
+
+  if (userId !== OWNER_ID) {
+    return telegram(
+      "answerInlineQuery",
+      {
+        inline_query_id:
+          q.id,
+        results: [],
+        cache_time: 0,
+        is_personal: true
+      },
+      env
+    );
+  }
+
+  const term =
+    String(q.query || "")
+      .trim();
+
+  const pattern =
+    `%${term}%`;
+
+  const rows =
+    (
+      await env.DB.prepare(`
+        SELECT
+          id,
+          file_id,
+          file_name,
+          custom_id,
+          file_size,
+          mime_type,
+          folder_id
+        FROM files
+        WHERE user_id = ?
+          AND (
+            ? = ''
+            OR file_name LIKE ?
+            OR custom_id LIKE ?
           )
-        )
+        ORDER BY created_at DESC
+        LIMIT ?
+      `).bind(
+        userId,
+        term,
+        pattern,
+        pattern,
+        MAX_INLINE
+      ).all()
+    ).results || [];
+
+  const results =
+    rows.map(
+      f =>
+        inlineResult(f)
     );
+
+  return telegram(
+    "answerInlineQuery",
+    {
+      inline_query_id:
+        q.id,
+      results,
+      cache_time: 0,
+      is_personal: true
+    },
+    env
+  );
 }
 
+function inlineResult(f) {
+  const title =
+    `${f.custom_id || "无ID"} · ${f.file_name}`;
 
-// ============================================================
-// Utility
-// ============================================================
+  const caption =
+    `🆔 ${
+      f.custom_id || ""
+    }\n` +
+    `📄 ${f.file_name}`;
 
-function isHttpUrl(
-  value
-) {
-
-  try {
-
-    const url =
-      new URL(
-        String(value)
-      );
-
-
-    return (
-      url.protocol ===
-        "http:" ||
-      url.protocol ===
-        "https:"
-    );
-
-  } catch {
-
-    return false;
+  if (
+    f.mime_type?.startsWith(
+      "image/"
+    )
+  ) {
+    return {
+      type: "photo",
+      id: String(f.id),
+      photo_file_id:
+        f.file_id,
+      title,
+      caption
+    };
   }
+
+  if (
+    f.mime_type?.startsWith(
+      "video/"
+    )
+  ) {
+    return {
+      type: "video",
+      id: String(f.id),
+      video_file_id:
+        f.file_id,
+      title,
+      mime_type:
+        f.mime_type,
+      caption
+    };
+  }
+
+  if (
+    f.mime_type?.startsWith(
+      "audio/"
+    )
+  ) {
+    return {
+      type: "audio",
+      id: String(f.id),
+      audio_file_id:
+        f.file_id,
+      title,
+      caption
+    };
+  }
+
+  if (
+    f.mime_type !==
+      "media/media_group" &&
+    f.mime_type !==
+      "text/link"
+  ) {
+    return {
+      type: "document",
+      id: String(f.id),
+      document_file_id:
+        f.file_id,
+      title,
+      caption
+    };
+  }
+
+  if (
+    f.mime_type ===
+    "text/link"
+  ) {
+    let x = {};
+
+    try {
+      x =
+        JSON.parse(
+          f.file_id
+        );
+    } catch {}
+
+    return {
+      type: "article",
+      id: String(f.id),
+      title,
+      description:
+        x.url ||
+        f.file_name,
+      input_message_content: {
+        message_text:
+          escapeHtml(
+            x.text ||
+            x.url ||
+            f.file_name
+          ),
+        parse_mode:
+          "HTML"
+      }
+    };
+  }
+
+  return {
+    type: "article",
+    id: String(f.id),
+    title,
+    description:
+      "媒体组",
+    input_message_content: {
+      message_text:
+        `📦 ${escapeHtml(
+          f.file_name
+        )}\n` +
+        `🆔 ${escapeHtml(
+          f.custom_id || ""
+        )}`,
+      parse_mode:
+        "HTML"
+    }
+  };
 }
 
+/* -------------------- Natural language / state -------------------- */
 
-function normalizeBaseUrl(
-  value
+async function handleState(
+  m,
+  state,
+  env
 ) {
+  const userId =
+    String(
+      m.from?.id ??
+      m.chat.id
+    );
 
-  try {
+  const chatId =
+    String(m.chat.id);
 
-    const url =
-      new URL(
-        String(value)
+  const text =
+    String(
+      m.text || ""
+    ).trim();
+
+  if (
+    state.startsWith(
+      "create_folder"
+    )
+  ) {
+    const parent =
+      state.includes(":")
+        ? Number(
+            state.slice(14)
+          )
+        : null;
+
+    await clearState(
+      userId,
+      env
+    );
+
+    const r =
+      await createFolderFromPath(
+        userId,
+        text,
+        env,
+        parent
       );
 
+    await sendMessage(
+      chatId,
+      r.message,
+      {},
+      env
+    );
 
-    if (
-      !/^https?:$/.test(
-        url.protocol
-      )
-    ) {
+    return true;
+  }
 
-      return null;
+  if (state === "search") {
+    await clearState(
+      userId,
+      env
+    );
+
+    await searchFiles(
+      userId,
+      chatId,
+      text,
+      env
+    );
+
+    return true;
+  }
+
+  if (
+    state.startsWith(
+      "rename_file:"
+    )
+  ) {
+    const id =
+      Number(
+        state.slice(12)
+      );
+
+    await clearState(
+      userId,
+      env
+    );
+
+    if (!text) return true;
+
+    const dup =
+      await env.DB.prepare(`
+        SELECT id
+        FROM files
+        WHERE user_id = ?
+          AND custom_id = ?
+          AND id != ?
+        LIMIT 1
+      `).bind(
+        userId,
+        text,
+        id
+      ).first();
+
+    if (dup) {
+      return sendMessage(
+        chatId,
+        "这个 ID 已经被使用了。",
+        {},
+        env
+      );
     }
 
+    await env.DB.prepare(`
+      UPDATE files
+      SET custom_id = ?
+      WHERE user_id = ?
+        AND id = ?
+    `).bind(
+      text,
+      userId,
+      id
+    ).run();
 
-    return url.origin;
-
-  } catch {
-
-    return null;
+    return sendMessage(
+      chatId,
+      `新的文件 ID：<code>${escapeHtml(
+        text
+      )}</code>`,
+      {},
+      env
+    );
   }
+
+  return false;
 }
 
-
-function stripHtml(
-  value
+async function parseNaturalLanguage(
+  text,
+  userId,
+  chatId,
+  env
 ) {
+  let m =
+    text.match(
+      /^(?:创建|新建|建立)(?:一个|个)?\s*(?:文件夹)?\s*(.+)$/i
+    );
 
-  return String(
-    value || ""
-  )
+  if (m) {
+    const r =
+      await createFolderFromPath(
+        userId,
+        cleanNaturalPath(
+          m[1]
+        ),
+        env
+      );
+
+    await sendMessage(
+      chatId,
+      r.message,
+      {},
+      env
+    );
+
+    return true;
+  }
+
+  m =
+    text.match(
+      /^(?:打开|进入|查看)\s*(?:文件夹)?\s*(.+)$/i
+    );
+
+  if (m) {
+    const f =
+      await findFolderByPath(
+        userId,
+        cleanNaturalPath(
+          m[1]
+        ),
+        env
+      );
+
+    if (f) {
+      await showFolder(
+        userId,
+        chatId,
+        f.id,
+        env
+      );
+    } else {
+      await sendMessage(
+        chatId,
+        "没有找到这个文件夹。",
+        {},
+        env
+      );
+    }
+
+    return true;
+  }
+
+  m =
+    text.match(
+      /^(?:搜索|查找|找一下|找找)\s*(.+)$/i
+    );
+
+  if (m) {
+    await searchFiles(
+      userId,
+      chatId,
+      m[1],
+      env
+    );
+
+    return true;
+  }
+
+  m =
+    text.match(
+      /^把(?:刚才的|刚才那个|这个|该)?\s*(?:文件|资源|媒体)?\s*(?:放到|移动到|存到)\s*(.+)$/i
+    );
+
+  if (m) {
+    const f =
+      await findFolderByPath(
+        userId,
+        cleanNaturalPath(
+          m[1]
+        ),
+        env
+      );
+
+    if (!f) {
+      return sendMessage(
+        chatId,
+        "没有找到这个文件夹。",
+        {},
+        env
+      );
+    }
+
+    const pending =
+      await getState(
+        userId,
+        env
+      );
+
+    if (
+      pending?.startsWith(
+        "pending_resource:"
+      )
+    ) {
+      const r =
+        parsePendingResource(
+          pending
+        );
+
+      if (
+        !await claimPending(
+          userId,
+          pending,
+          env
+        )
+      ) {
+        return sendMessage(
+          chatId,
+          "这个待处理资源正在被另一条消息处理，请稍后再试。",
+          {},
+          env
+        );
+      }
+
+      return finishSave(
+        userId,
+        chatId,
+        r,
+        f.id,
+        env
+      );
+    }
+
+    const latest =
+      await env.DB.prepare(`
+        SELECT *
+        FROM files
+        WHERE user_id = ?
+        ORDER BY created_at DESC
+        LIMIT 1
+      `).bind(
+        userId
+      ).first();
+
+    if (!latest) {
+      await setState(
+        userId,
+        `move_to:${f.id}`,
+        env
+      );
+
+      return sendMessage(
+        chatId,
+        "把文件发给我，我会直接放进这个文件夹。",
+        {},
+        env
+      );
+    }
+
+    await env.DB.prepare(`
+      UPDATE files
+      SET folder_id = ?
+      WHERE user_id = ?
+        AND id = ?
+    `).bind(
+      f.id,
+      userId,
+      latest.id
+    ).run();
+
+    return sendMessage(
+      chatId,
+      `已移动：<b>${escapeHtml(
+        latest.file_name
+      )}</b>\n` +
+        `📁 <code>${escapeHtml(
+          await getFolderPath(
+            userId,
+            f.id,
+            env
+          )
+        )}</code>`,
+      {},
+      env
+    );
+  }
+
+  m =
+    text.match(
+      /^把\s*(.+?)\s*(?:改名为|重命名为)\s*(.+)$/i
+    );
+
+  if (m) {
+    const f =
+      await findFolderByPath(
+        userId,
+        cleanNaturalPath(
+          m[1]
+        ),
+        env
+      );
+
+    if (!f) {
+      return sendMessage(
+        chatId,
+        "没有找到这个文件夹。",
+        {},
+        env
+      );
+    }
+
+    const name =
+      cleanNaturalPath(
+        m[2]
+      )
+        .split("/")
+        .pop();
+
+    const dup =
+      await env.DB.prepare(`
+        SELECT id
+        FROM folders
+        WHERE user_id = ?
+          AND name = ?
+          AND (
+            (parent_id = ?)
+            OR
+            (
+              parent_id IS NULL
+              AND ? IS NULL
+            )
+          )
+          AND id != ?
+      `).bind(
+        userId,
+        name,
+        f.parent_id,
+        f.parent_id,
+        f.id
+      ).first();
+
+    if (dup) {
+      return sendMessage(
+        chatId,
+        "同一级目录已有这个文件夹。",
+        {},
+        env
+      );
+    }
+
+    await env.DB.prepare(`
+      UPDATE folders
+      SET name = ?
+      WHERE user_id = ?
+        AND id = ?
+    `).bind(
+      name,
+      userId,
+      f.id
+    ).run();
+
+    return sendMessage(
+      chatId,
+      `已改名为：<b>${escapeHtml(
+        name
+      )}</b>`,
+      {},
+      env
+    );
+  }
+
+  m =
+    text.match(
+      /^(?:删除|删掉|移除)\s*(?:文件夹)?\s*(.+)$/i
+    );
+
+  if (m) {
+    const f =
+      await findFolderByPath(
+        userId,
+        cleanNaturalPath(
+          m[1]
+        ),
+        env
+      );
+
+    if (!f) {
+      return sendMessage(
+        chatId,
+        "没有找到这个文件夹。",
+        {},
+        env
+      );
+    }
+
+    const child =
+      await env.DB.prepare(`
+        SELECT id
+        FROM folders
+        WHERE user_id = ?
+          AND parent_id = ?
+        LIMIT 1
+      `).bind(
+        userId,
+        f.id
+      ).first();
+
+    const file =
+      await env.DB.prepare(`
+        SELECT id
+        FROM files
+        WHERE user_id = ?
+          AND folder_id = ?
+        LIMIT 1
+      `).bind(
+        userId,
+        f.id
+      ).first();
+
+    if (child || file) {
+      return sendMessage(
+        chatId,
+        "这个文件夹里面还有内容，请先清空。",
+        {},
+        env
+      );
+    }
+
+    await env.DB.prepare(`
+      DELETE FROM folders
+      WHERE user_id = ?
+        AND id = ?
+    `).bind(
+      userId,
+      f.id
+    ).run();
+
+    return sendMessage(
+      chatId,
+      `已删除：<code>${escapeHtml(
+        cleanNaturalPath(
+          m[1]
+        )
+      )}</code>`,
+      {},
+      env
+    );
+  }
+
+  return false;
+}
+
+async function createFolderFromPath(
+  userId,
+  input,
+  env,
+  startParentId = null
+) {
+  const parts =
+    cleanNaturalPath(
+      input
+    )
+      .split("/")
+      .filter(Boolean);
+
+  if (!parts.length) {
+    return {
+      message:
+        "主人没有告诉我要创建什么文件夹。"
+    };
+  }
+
+  let parent =
+    startParentId;
+
+  const created = [];
+
+  for (const name of parts) {
+    let f;
+
+    if (parent === null) {
+      f =
+        await env.DB.prepare(`
+          SELECT id,name,parent_id
+          FROM folders
+          WHERE user_id = ?
+            AND name = ?
+            AND parent_id IS NULL
+          LIMIT 1
+        `).bind(
+          userId,
+          name
+        ).first();
+    } else {
+      f =
+        await env.DB.prepare(`
+          SELECT id,name,parent_id
+          FROM folders
+          WHERE user_id = ?
+            AND name = ?
+            AND parent_id = ?
+          LIMIT 1
+        `).bind(
+          userId,
+          name,
+          parent
+        ).first();
+    }
+
+    if (!f) {
+      const r =
+        await env.DB.prepare(`
+          INSERT INTO folders(
+            user_id,
+            name,
+            parent_id
+          )
+          VALUES(?,?,?)
+        `).bind(
+          userId,
+          name,
+          parent
+        ).run();
+
+      parent =
+        r.meta.last_row_id;
+
+      created.push(name);
+    } else {
+      parent = f.id;
+    }
+  }
+
+  return {
+    message:
+      created.length
+        ? `好的，主人。\n\n📁 已经准备好：<code>${escapeHtml(
+            parts.join("/")
+          )}</code>`
+        : `这个文件夹本来就已经存在：<code>${escapeHtml(
+            parts.join("/")
+          )}</code>`
+  };
+}
+
+async function findFolderByPath(
+  userId,
+  input,
+  env
+) {
+  const parts =
+    cleanNaturalPath(
+      input
+    )
+      .split("/")
+      .filter(Boolean);
+
+  let parent = null;
+  let f = null;
+
+  for (const name of parts) {
+    if (parent === null) {
+      f =
+        await env.DB.prepare(`
+          SELECT id,name,parent_id
+          FROM folders
+          WHERE user_id = ?
+            AND name = ?
+            AND parent_id IS NULL
+          LIMIT 1
+        `).bind(
+          userId,
+          name
+        ).first();
+    } else {
+      f =
+        await env.DB.prepare(`
+          SELECT id,name,parent_id
+          FROM folders
+          WHERE user_id = ?
+            AND name = ?
+            AND parent_id = ?
+          LIMIT 1
+        `).bind(
+          userId,
+          name,
+          parent
+        ).first();
+    }
+
+    if (!f) return null;
+
+    parent = f.id;
+  }
+
+  return f;
+}
+
+async function searchFiles(
+  userId,
+  chatId,
+  keyword,
+  env
+) {
+  const p =
+    `%${String(
+      keyword || ""
+    ).trim()}%`;
+
+  const files =
+    (
+      await env.DB.prepare(`
+        SELECT id,file_name,custom_id,mime_type
+        FROM files
+        WHERE user_id = ?
+          AND (
+            file_name LIKE ?
+            OR custom_id LIKE ?
+          )
+        ORDER BY created_at DESC
+        LIMIT 50
+      `).bind(
+        userId,
+        p,
+        p
+      ).all()
+    ).results || [];
+
+  const folders =
+    (
+      await env.DB.prepare(`
+        SELECT id,name
+        FROM folders
+        WHERE user_id = ?
+          AND name LIKE ?
+        ORDER BY name
+        LIMIT 20
+      `).bind(
+        userId,
+        p
+      ).all()
+    ).results || [];
+
+  const buttons = [
+    ...files.map(
+      f => [
+        {
+          text:
+            `${getResourceIcon(
+              f.mime_type
+            )} ` +
+            `${f.custom_id || "无ID"} · ` +
+            `${truncate(
+              f.file_name,
+              20
+            )}`,
+          callback_data:
+            `file:${f.id}`
+        }
+      ]
+    ),
+
+    ...folders.map(
+      f => [
+        {
+          text:
+            `📁 ${f.name}`,
+          callback_data:
+            `folder:${f.id}`
+        }
+      ]
+    )
+  ];
+
+  return sendMessage(
+    chatId,
+    `🔎 <b>搜索结果</b>\n\n` +
+      `资源：${files.length}\n` +
+      `文件夹：${folders.length}`,
+    {
+      reply_markup: {
+        inline_keyboard:
+          buttons
+      }
+    },
+    env
+  );
+}
+
+/* -------------------- State DB -------------------- */
+
+async function getStateRecord(
+  userId,
+  env
+) {
+  return env.DB.prepare(`
+    SELECT
+      state,
+      last_folder_id,
+      progress_message_id,
+      batch_done,
+      batch_total
+    FROM user_states
+    WHERE chat_id = ?
+    LIMIT 1
+  `).bind(
+    userId
+  ).first();
+}
+
+async function getState(
+  userId,
+  env
+) {
+  return (
+    await getStateRecord(
+      userId,
+      env
+    )
+  )?.state || null;
+}
+
+async function setState(
+  userId,
+  state,
+  env
+) {
+  await env.DB.prepare(`
+    INSERT INTO user_states(
+      chat_id,
+      state,
+      updated_at
+    )
+    VALUES(
+      ?,
+      ?,
+      CURRENT_TIMESTAMP
+    )
+    ON CONFLICT(chat_id)
+    DO UPDATE SET
+      state = excluded.state,
+      updated_at = CURRENT_TIMESTAMP
+  `).bind(
+    userId,
+    state
+  ).run();
+}
+
+async function clearState(
+  userId,
+  env
+) {
+  await env.DB.prepare(`
+    UPDATE user_states
+    SET
+      state = '',
+      progress_message_id = NULL,
+      batch_done = 0,
+      batch_total = 0,
+      updated_at = CURRENT_TIMESTAMP
+    WHERE chat_id = ?
+  `).bind(
+    userId
+  ).run();
+}
+
+async function setLastFolder(
+  userId,
+  folderId,
+  env
+) {
+  await env.DB.prepare(`
+    INSERT INTO user_states(
+      chat_id,
+      last_folder_id,
+      updated_at
+    )
+    VALUES(
+      ?,
+      ?,
+      CURRENT_TIMESTAMP
+    )
+    ON CONFLICT(chat_id)
+    DO UPDATE SET
+      last_folder_id = excluded.last_folder_id,
+      updated_at = CURRENT_TIMESTAMP
+  `).bind(
+    userId,
+    folderId
+  ).run();
+}
+
+/* -------------------- Helpers -------------------- */
+
+function containsUrl(t) {
+  return !!extractFirstUrl(t);
+}
+
+function extractFirstUrl(t) {
+  const m =
+    String(t || "").match(
+      /(?:(?:https?:\/\/)|www\.)[^\s<>"']+/i
+    );
+
+  if (!m) return null;
+
+  let u =
+    m[0].replace(
+      /[，。！？；：）》）】》"'、]+$/g,
+      ""
+    );
+
+  return u.startsWith("www.")
+    ? "https://" + u
+    : u;
+}
+
+function getResourceIcon(m) {
+  if (
+    m === "media/media_group"
+  ) {
+    return "📦";
+  }
+
+  if (
+    m === "text/link"
+  ) {
+    return "🔗";
+  }
+
+  if (
+    m?.startsWith("image/")
+  ) {
+    return "🖼";
+  }
+
+  if (
+    m?.startsWith("video/")
+  ) {
+    return "🎬";
+  }
+
+  if (
+    m?.startsWith("audio/")
+  ) {
+    return "🎵";
+  }
+
+  return "📄";
+}
+
+function cleanNaturalPath(t) {
+  return String(t || "")
+    .trim()
     .replace(
-      /<br\s*\/?>/gi,
-      "\n"
+      /^['"“”‘’]+|['"“”‘’]+$/g,
+      ""
     )
     .replace(
-      /<[^>]+>/g,
-      " "
+      /^文件夹[：:]\s*/i,
+      ""
     )
     .replace(
-      /\s+/g,
-      " "
+      /\\/g,
+      "/"
+    )
+    .replace(
+      /\/+/g,
+      "/"
+    )
+    .replace(
+      /^\/|\/$/g,
+      ""
     )
     .trim();
 }
 
+function truncate(t, n) {
+  const s =
+    String(t || "");
 
-function escapeHtml(
-  value
-) {
+  return s.length <= n
+    ? s
+    : s.slice(0, n - 1) + "…";
+}
 
-  return String(
-    value ?? ""
-  )
+function formatFileSize(b) {
+  if (b < 1024) {
+    return `${b} B`;
+  }
+
+  if (b < 1048576) {
+    return `${(
+      b / 1024
+    ).toFixed(1)} KB`;
+  }
+
+  if (b < 1073741824) {
+    return `${(
+      b / 1048576
+    ).toFixed(1)} MB`;
+  }
+
+  return `${(
+    b / 1073741824
+  ).toFixed(2)} GB`;
+}
+
+function escapeHtml(t) {
+  return String(t ?? "")
     .replace(
       /&/g,
       "&amp;"
@@ -5584,198 +4337,125 @@ function escapeHtml(
     );
 }
 
-
-function xmlEscape(
-  value
-) {
-
-  return escapeHtml(
-    value
+function escapeRegExp(t) {
+  return String(t).replace(
+    /[.*+?^${}()|[\]\\]/g,
+    "\\$&"
   );
 }
 
-
-function mediaType(
-  type,
-  url
-) {
-
-  const value =
-    String(
-      type || ""
-    ).toLowerCase();
-
-
-  if (
-    value.includes(
-      "video"
-    )
-  ) {
-
-    return "video";
-  }
-
-
-  if (
-    value.includes(
-      "gif"
-    )
-  ) {
-
-    return "animation";
-  }
-
-
-  if (
-    /\.(mp4|webm|mov)(\?|$)/i.test(
-      url
-    )
-  ) {
-
-    return "video";
-  }
-
-
-  if (
-    /\.gif(\?|$)/i.test(
-      url
-    )
-  ) {
-
-    return "animation";
-  }
-
-
-  return "photo";
-}
-
-
-function toIso(
-  value
-) {
-
-  if (!value) {
-    return now();
-  }
-
-
-  const date =
-    new Date(value);
-
-
-  if (
-    Number.isNaN(
-      date.getTime()
-    )
-  ) {
-
-    return now();
-  }
-
-
-  return date.toISOString();
-}
-
-
-function formatDate(
-  value
-) {
-
-  try {
-
-    return new Date(
-      value
-    ).toLocaleString(
-      "zh-CN",
-      {
-        timeZone:
-          "Asia/Shanghai",
-
-        hour12:
-          false
-      }
-    );
-
-  } catch {
-
-    return String(value);
-  }
-}
-
-
-function now() {
-
-  return new Date()
-    .toISOString();
-}
-
-
-function hashString(
-  value
-) {
-
-  let hash =
-    2166136261;
-
-
-  const text =
-    String(
-      value || ""
-    );
-
-
-  for (
-    let i = 0;
-    i < text.length;
-    i++
-  ) {
-
-    hash ^=
-      text.charCodeAt(i);
-
-
-    hash =
-      Math.imul(
-        hash,
-        16777619
+function cleanIdPrefix(n) {
+  const p =
+    String(n)
+      .trim()
+      .replace(
+        /\s+/g,
+        "-"
+      )
+      .replace(
+        /[^\w\u4e00-\u9fff-]/g,
+        ""
       );
-  }
-
 
   return (
-    hash >>> 0
-  ).toString(16);
+    p || "FILE"
+  ).slice(0, 30);
 }
 
+function sanitizeName(s) {
+  return String(s || "")
+    .replace(
+      /\s+/g,
+      " "
+    )
+    .replace(
+      /[\\/:*?"<>|]/g,
+      ""
+    )
+    .trim()
+    .slice(0, 80);
+}
 
-function json(
-  value,
-  status = 200
-) {
+function deriveName(r) {
+  let n = "";
 
-  return new Response(
-    JSON.stringify(value),
-    {
-      status,
+  if (r.type === "link") {
+    n =
+      sanitizeName(
+        r.text
+      )
+        .replace(
+          /https?:\/\/\S+/g,
+          ""
+        )
+        .trim();
+  } else if (
+    r.type === "media_group"
+  ) {
+    n =
+      sanitizeName(
+        r.items?.[0]?.caption
+      ) ||
+      (
+        (r.items || []).some(
+          x =>
+            x.kind === "photo"
+        ) &&
+        (r.items || []).some(
+          x =>
+            x.kind === "video"
+        )
+      )
+        ? `图片+视频组_${r.items.length}项`
+        : (r.items || []).some(
+            x =>
+              x.kind === "photo"
+          )
+          ? `图片组_${r.items.length}张`
+          : `媒体组_${
+              r.items?.length ||
+              0
+            }项`;
+  } else {
+    n =
+      sanitizeName(
+        r.caption
+      ) ||
+      (r.fileName || "")
+        .replace(
+          /\.[a-z0-9]+$/i,
+          ""
+        );
+  }
 
-      headers: {
-        "content-type":
-          "application/json;charset=utf-8"
-      }
-    }
+  return (
+    n ||
+    `${
+      r.type === "link"
+        ? "链接"
+        : r.type ===
+          "media_group"
+          ? "媒体组"
+          : "文件"
+    }_${Date.now()}`
   );
 }
 
+function uniqueBy(
+  arr,
+  key
+) {
+  const m =
+    new Map();
 
-// ============================================================
-// Exports
-// ============================================================
+  for (const x of arr) {
+    m.set(
+      key(x),
+      x
+    );
+  }
 
-export {
-  parseFeed,
-  parseOPML,
-  classifyEntry,
-  normalizeBaseUrl,
-  escapeHtml,
-  mediaType
-};
+  return [
+    ...m.values()
+  ];
+}
