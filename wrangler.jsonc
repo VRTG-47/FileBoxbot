@@ -1,20 +1,16 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "rssreaderbot",
+  "name": "iresiabot",
   "main": "worker.js",
   "compatibility_date": "2026-09-28",
 
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "rssreaderbot",
-      "database_id": "00a5aa87-4794-4e04-961f-88ac19ec594b"
+      "database_name": "iresiabot-file-db",
+      "database_id": "e71d82da-a001-49b9-a1b3-1d50deeb37da"
     }
-  ],
-
-  "triggers": {
-    "crons": [
-      "0 */1 * * *"
+  ]
     ]
   }
 }
