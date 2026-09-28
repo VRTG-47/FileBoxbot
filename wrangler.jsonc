@@ -1,0 +1,20 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "rssreaderbot",
+  "main": "worker.js",
+  "compatibility_date": "2026-09-28",
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "rssreaderbot",
+      "database_id": "00a5aa87-4794-4e04-961f-88ac19ec594b"
+    }
+  ],
+
+  "triggers": {
+    "crons": [
+      "0 */1 * * *"
+    ]
+  }
+}
