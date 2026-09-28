@@ -1,14 +1,53 @@
 const OWNER_ID = "7559560220";
-
 const BOT_NAME = "伊蕾希娅";
 
+const PAGE_SIZE = 8;
+const SEARCH_PAGE_SIZE = 8;
 const MAX_INLINE = 20;
+const MEDIA_GROUP_WAIT = 600;
+
+// ============================================================
+// Cloudflare Worker
+// Telegram Private File Manager
+//
+// D1:
+//   files
+//   folders
+//   user_states
+//
+// Required secrets:
+//   BOT_TOKEN
+//
+// Recommended indexes:
+//
+// CREATE UNIQUE INDEX IF NOT EXISTS
+// idx_files_user_dedupe
+// ON files(user_id, file_unique_id);
+//
+// CREATE UNIQUE INDEX IF NOT EXISTS
+// idx_files_user_custom_id
+// ON files(user_id, custom_id);
+//
+// CREATE INDEX IF NOT EXISTS
+// idx_files_user_folder
+// ON files(user_id, folder_id);
+//
+// CREATE INDEX IF NOT EXISTS
+// idx_files_user_created
+// ON files(user_id, created_at);
+//
+// CREATE INDEX IF NOT EXISTS
+// idx_folders_user_parent
+// ON folders(user_id, parent_id);
+// ============================================================
 
 export default {
   async fetch(request, env) {
     try {
       if (request.method === "GET") {
-        return new Response(`${BOT_NAME}在这里等候主人。`);
+        return new Response(
+          `${BOT_NAME}在这里等候主人。`
+        );
       }
 
       if (request.method !== "POST") {
@@ -17,18 +56,31 @@ export default {
         });
       }
 
-      await handleUpdate(await request.json(), env);
+      const update = await request.json();
+
+      await handleUpdate(update, env);
 
       return new Response("OK");
     } catch (e) {
-      console.error("WORKER ERROR", e?.stack || e);
+      console.error(
+        "WORKER ERROR",
+        e?.stack || e
+      );
 
-      return new Response("Internal Server Error", {
-        status: 500
-      });
+      return new Response(
+        "Internal Server Error",
+        {
+          status: 500
+        }
+      );
     }
   }
 };
+
+
+// ============================================================
+// Telegram API
+// ============================================================
 
 async function telegram(method, body, env) {
   const r = await fetch(
@@ -46,7 +98,7 @@ async function telegram(method, body, env) {
 
   if (!data.ok) {
     console.error(
-      "Telegram API Error",
+      "Telegram API Error:",
       method,
       data
     );
@@ -54,6 +106,7 @@ async function telegram(method, body, env) {
 
   return data;
 }
+
 
 async function sendMessage(
   chatId,
@@ -73,6 +126,54 @@ async function sendMessage(
   );
 }
 
+
+async function editMessage(
+  chatId,
+  messageId,
+  text,
+  options = {},
+  env
+) {
+  return telegram(
+    "editMessageText",
+    {
+      chat_id: chatId,
+      message_id: Number(messageId),
+      text,
+      parse_mode: "HTML",
+      ...options
+    },
+    env
+  );
+}
+
+
+async function answerCallback(
+  callbackQueryId,
+  text = "",
+  showAlert = false,
+  env
+) {
+  return telegram(
+    "answerCallbackQuery",
+    {
+      callback_query_id: callbackQueryId,
+      ...(text
+        ? {
+            text
+          }
+        : {}),
+      show_alert: showAlert
+    },
+    env
+  );
+}
+
+
+// ============================================================
+// Update router
+// ============================================================
+
 async function handleUpdate(update, env) {
   if (update.inline_query) {
     return handleInlineQuery(
@@ -83,89 +184,208 @@ async function handleUpdate(update, env) {
 
   if (update.callback_query) {
     const q = update.callback_query;
-    const userId = String(q.from.id);
+
+    const userId =
+      String(q.from?.id || "");
 
     if (userId !== OWNER_ID) {
-      await telegram(
-        "answerCallbackQuery",
-        {
-          callback_query_id: q.id,
-          text: "这是主人的私人文件库。",
-          show_alert: true
-        },
+      return answerCallback(
+        q.id,
+        "这是主人的私人文件库。",
+        true,
         env
       );
-
-      return;
     }
 
-    await handleCallback(q, env);
+    return handleCallback(
+      q,
+      env
+    );
+  }
+
+  if (!update.message) {
     return;
   }
 
-  if (!update.message) return;
-
   const m = update.message;
 
-  const userId = String(
-    m.from?.id ?? m.chat?.id
-  );
+  const userId =
+    String(
+      m.from?.id ??
+      m.chat?.id ??
+      ""
+    );
 
-  const chatId = String(
-    m.chat?.id
-  );
+  const chatId =
+    String(
+      m.chat?.id ??
+      ""
+    );
 
   if (userId !== OWNER_ID) {
-    await sendMessage(
+    return sendMessage(
       chatId,
       "抱歉，这里是主人的私人文件库。",
       {},
       env
     );
-
-    return;
   }
 
   if (
     m.document ||
     m.video ||
     m.audio ||
-    m.photo
+    m.photo ||
+    m.animation ||
+    m.voice ||
+    m.video_note
   ) {
-    return handleMediaMessage(m, env);
+    return handleMediaMessage(
+      m,
+      env
+    );
   }
 
   if (m.text) {
-    return handleText(m, env);
+    return handleText(
+      m,
+      env
+    );
   }
 }
 
+
+// ============================================================
+// Home
+// ============================================================
+
+function homeKeyboard() {
+  return {
+    inline_keyboard: [
+      [
+        {
+          text: "📄 最近资源",
+          callback_data: "home:recent"
+        },
+        {
+          text: "📁 文件夹",
+          callback_data: "home:folders"
+        }
+      ],
+      [
+        {
+          text: "🔎 搜索",
+          callback_data: "home:search"
+        },
+        {
+          text: "❓ 帮助",
+          callback_data: "home:help"
+        }
+      ]
+    ]
+  };
+}
+
+
+async function sendHome(
+  chatId,
+  env
+) {
+  return sendMessage(
+    chatId,
+    `<b>${BOT_NAME} 文件管家</b>\n\n` +
+      `欢迎回来，主人。\n` +
+      `这里是你的私人 Telegram 文件库。\n\n` +
+      `📦 文件储存在 Telegram\n` +
+      `📁 D1 保存目录与索引\n` +
+      `🔎 支持文件名 / ID 搜索\n` +
+      `🆔 每个资源拥有独立 ID`,
+    {
+      reply_markup:
+        homeKeyboard()
+    },
+    env
+  );
+}
+
+
+async function sendHelp(
+  chatId,
+  env
+) {
+  return sendMessage(
+    chatId,
+    `<b>${BOT_NAME} 文件管家</b>\n\n` +
+
+      `<b>📁 文件夹</b>\n` +
+      `创建 游戏\n` +
+      `创建 游戏/FGO/攻略\n` +
+      `打开 游戏/FGO\n` +
+      `删除 游戏/FGO\n` +
+      `把 FGO 改名为 命运冠位指定\n\n` +
+
+      `<b>📦 文件</b>\n` +
+      `直接发送文件、图片、视频、音频。\n` +
+      `发送链接也可以直接归档。\n\n` +
+
+      `<b>🔎 搜索</b>\n` +
+      `可以搜索文件名、自定义 ID、文件夹。\n\n` +
+
+      `<b>🆔 ID</b>\n` +
+      `每个资源都会自动获得唯一 ID。\n` +
+      `详情页可以修改 ID。\n\n` +
+
+      `<b>📤 取出</b>\n` +
+      `取出资源后，会在实际资源消息下面显示上一项 / 下一项。`,
+    {},
+    env
+  );
+}
+
+
+// ============================================================
+// Text
+// ============================================================
+
 async function handleText(m, env) {
-  const userId = String(
-    m.from?.id ?? m.chat.id
-  );
+  const userId =
+    String(
+      m.from?.id ??
+      m.chat.id
+    );
 
-  const chatId = String(
-    m.chat.id
-  );
+  const chatId =
+    String(m.chat.id);
 
-  const text = String(
-    m.text || ""
-  ).trim();
+  const text =
+    String(
+      m.text || ""
+    ).trim();
 
   if (text === "/start") {
-    await clearState(userId, env);
-    return sendHome(chatId, env);
+    await clearState(
+      userId,
+      env
+    );
+
+    return sendHome(
+      chatId,
+      env
+    );
   }
 
   if (text === "/help") {
-    return sendHelp(chatId, env);
+    return sendHelp(
+      chatId,
+      env
+    );
   }
 
-  const state = await getState(
-    userId,
-    env
-  );
+  const state =
+    await getState(
+      userId,
+      env
+    );
 
   if (
     state &&
@@ -173,34 +393,43 @@ async function handleText(m, env) {
       "pending_resource:"
     )
   ) {
-    if (
+    const handled =
       await handleState(
         m,
         state,
         env
-      )
-    ) {
+      );
+
+    if (handled) {
       return;
     }
   }
 
-  if (text === "📄 我的文件") {
+  if (
+    text === "📄 我的文件"
+  ) {
     return showRecentFiles(
       userId,
       chatId,
+      0,
       env
     );
   }
 
-  if (text === "📁 文件夹") {
+  if (
+    text === "📁 文件夹"
+  ) {
     return showFolderRoot(
       userId,
       chatId,
+      0,
       env
     );
   }
 
-  if (text === "🔎 搜索") {
+  if (
+    text === "🔎 搜索"
+  ) {
     await setState(
       userId,
       "search",
@@ -209,7 +438,8 @@ async function handleText(m, env) {
 
     return sendMessage(
       chatId,
-      "主人想找什么？\n\n可以输入文件名、文件 ID 或关键词。",
+      "主人想找什么？\n\n" +
+        "可以输入文件名、文件 ID 或关键词。",
       {},
       env
     );
@@ -233,93 +463,36 @@ async function handleText(m, env) {
     return;
   }
 
-  await sendMessage(
+  return sendMessage(
     chatId,
-    "主人，我暂时没理解这句话。\n\n" +
-      "可以：\n" +
-      "📁 <code>创建 游戏/FGO/攻略</code>\n" +
-      "📂 <code>打开 游戏/FGO</code>\n" +
-      "🔎 <code>搜索 FGO</code>\n" +
-      "📦 <code>把刚才那个资源放到 游戏/FGO</code>\n" +
-      "🗑 <code>删除 游戏/FGO</code>",
+    `主人，我暂时没理解这句话。\n\n` +
+      `📁 <code>创建 游戏/FGO</code>\n` +
+      `📂 <code>打开 游戏/FGO</code>\n` +
+      `🔎 <code>搜索 FGO</code>\n` +
+      `📦 <code>把刚才那个资源放到 游戏/FGO</code>\n` +
+      `🗑 <code>删除 游戏/FGO</code>`,
     {},
     env
   );
 }
 
-function homeKeyboard() {
-  return {
-    keyboard: [
-      [
-        {
-          text: "📄 我的文件"
-        },
-        {
-          text: "📁 文件夹"
-        }
-      ],
-      [
-        {
-          text: "🔎 搜索"
-        }
-      ]
-    ],
-    resize_keyboard: true
-  };
-}
 
-async function sendHome(
-  chatId,
-  env
-) {
-  return sendMessage(
-    chatId,
-    `欢迎回来，主人。\n\n${BOT_NAME}一直在这里。`,
-    {
-      reply_markup: homeKeyboard()
-    },
-    env
-  );
-}
-
-async function sendHelp(
-  chatId,
-  env
-) {
-  return sendMessage(
-    chatId,
-    `<b>${BOT_NAME}文件管家</b>\n\n` +
-      `<b>📁 文件夹</b>\n` +
-      `创建 游戏\n` +
-      `创建 游戏/FGO/攻略\n` +
-      `打开 游戏/FGO\n` +
-      `删除 游戏/FGO\n` +
-      `把 FGO 改名为 命运冠位指定\n\n` +
-      `<b>📦 资源</b>\n` +
-      `直接发送文件、图片、视频、音频或链接。\n\n` +
-      `<b>🔎 搜索</b>\n` +
-      `搜索 文件名、ID 或关键词。\n\n` +
-      `<b>🆔 ID</b>\n` +
-      `资源自动获得自定义 ID，详情页可修改。\n` +
-      `取出资源后，可以直接在实际文件下面使用上一项/下一项浏览。`,
-    {},
-    env
-  );
-}
-
-/* -------------------- Resource intake -------------------- */
+// ============================================================
+// Resource intake
+// ============================================================
 
 async function handleMediaMessage(
   m,
   env
 ) {
-  const userId = String(
-    m.from?.id ?? m.chat.id
-  );
+  const userId =
+    String(
+      m.from?.id ??
+      m.chat.id
+    );
 
-  const chatId = String(
-    m.chat.id
-  );
+  const chatId =
+    String(m.chat.id);
 
   if (m.media_group_id) {
     return handleMediaGroupItem(
@@ -333,7 +506,9 @@ async function handleMediaMessage(
   const resource =
     extractSingleMediaResource(m);
 
-  if (!resource) return;
+  if (!resource) {
+    return;
+  }
 
   const state =
     await getState(
@@ -341,10 +516,17 @@ async function handleMediaMessage(
       env
     );
 
-  if (state?.startsWith("move_to:")) {
-    const folderId = Number(
-      state.slice(8)
-    );
+  if (
+    state?.startsWith(
+      "move_to:"
+    )
+  ) {
+    const folderId =
+      Number(
+        state.slice(
+          "move_to:".length
+        )
+      );
 
     await clearState(
       userId,
@@ -368,33 +550,40 @@ async function handleMediaMessage(
   );
 }
 
+
 async function handleLinkMessage(
   m,
   env
 ) {
-  const userId = String(
-    m.from?.id ?? m.chat.id
-  );
+  const userId =
+    String(
+      m.from?.id ??
+      m.chat.id
+    );
 
-  const chatId = String(
-    m.chat.id
-  );
+  const chatId =
+    String(m.chat.id);
 
-  const text = String(
-    m.text || ""
-  ).trim();
+  const text =
+    String(
+      m.text || ""
+    ).trim();
 
   const url =
     extractFirstUrl(text);
 
-  if (!url) return;
+  if (!url) {
+    return;
+  }
 
   const resource = {
     type: "link",
     url,
     text,
-    messageId: m.message_id,
-    createdAt: Date.now()
+    messageId:
+      m.message_id,
+    createdAt:
+      Date.now()
   };
 
   const state =
@@ -403,10 +592,17 @@ async function handleLinkMessage(
       env
     );
 
-  if (state?.startsWith("move_to:")) {
-    const folderId = Number(
-      state.slice(8)
-    );
+  if (
+    state?.startsWith(
+      "move_to:"
+    )
+  ) {
+    const folderId =
+      Number(
+        state.slice(
+          "move_to:".length
+        )
+      );
 
     await clearState(
       userId,
@@ -429,6 +625,11 @@ async function handleLinkMessage(
     env
   );
 }
+
+
+// ============================================================
+// Pending resource state machine
+// ============================================================
 
 async function acceptIncomingResource(
   userId,
@@ -438,7 +639,7 @@ async function acceptIncomingResource(
 ) {
   for (
     let attempt = 0;
-    attempt < 4;
+    attempt < 5;
     attempt++
   ) {
     const state =
@@ -451,10 +652,7 @@ async function acceptIncomingResource(
       state?.state ===
       "auto_archiving"
     ) {
-      await new Promise(
-        r => setTimeout(r, 25)
-      );
-
+      await sleep(30);
       continue;
     }
 
@@ -468,10 +666,19 @@ async function acceptIncomingResource(
           state.state
         );
 
+      if (!old) {
+        await clearState(
+          userId,
+          env
+        );
+
+        continue;
+      }
+
       if (!state.last_folder_id) {
         await sendMessage(
           chatId,
-          "主人，还有一个资源正在等待整理。请先选择它的文件夹。",
+          "主人，还有一个资源正在等待整理，请先选择它的文件夹。",
           {},
           env
         );
@@ -486,7 +693,9 @@ async function acceptIncomingResource(
           env
         );
 
-      if (!claimed) continue;
+      if (!claimed) {
+        continue;
+      }
 
       try {
         await saveAndReplacePending(
@@ -530,22 +739,21 @@ async function acceptIncomingResource(
       env
     );
 
-    await chooseFolderForUpload(
+    return chooseFolderForUpload(
       userId,
       chatId,
       env
     );
-
-    return;
   }
 
-  await sendMessage(
+  return sendMessage(
     chatId,
     "正在处理上一条资源，请稍后再发送。",
     {},
     env
   );
 }
+
 
 async function saveAndReplacePending(
   userId,
@@ -555,7 +763,7 @@ async function saveAndReplacePending(
   newResource,
   env
 ) {
-  const oldResult =
+  const oldPrepared =
     await prepareSave(
       userId,
       oldResource,
@@ -569,13 +777,14 @@ async function saveAndReplacePending(
     );
 
   await env.DB.batch([
-    oldResult.statement,
+    oldPrepared.statement,
 
     env.DB.prepare(`
       UPDATE user_states
-      SET state = ?,
-          last_folder_id = ?,
-          updated_at = CURRENT_TIMESTAMP
+      SET
+        state = ?,
+        last_folder_id = ?,
+        updated_at = CURRENT_TIMESTAMP
       WHERE chat_id = ?
         AND state = ?
     `).bind(
@@ -586,19 +795,19 @@ async function saveAndReplacePending(
     )
   ]);
 
-  await showBatchProgress(
-    userId,
+  await sendSavedMessage(
     chatId,
-    oldResult.result,
+    oldPrepared.result,
     env
   );
 
-  await chooseFolderForUpload(
+  return chooseFolderForUpload(
     userId,
     chatId,
     env
   );
 }
+
 
 async function finishSave(
   userId,
@@ -637,11 +846,11 @@ async function finishSave(
         )
         VALUES(
           ?,
+          '',
           ?,
-          ?,
-          ?,
-          ?,
-          ?,
+          NULL,
+          0,
+          0,
           CURRENT_TIMESTAMP
         )
         ON CONFLICT(chat_id)
@@ -654,37 +863,24 @@ async function finishSave(
           updated_at = CURRENT_TIMESTAMP
       `).bind(
         userId,
-        null,
-        folderId,
-        null,
-        0,
-        0
+        folderId
       )
     ]);
 
     if (
       before?.progress_message_id
     ) {
-      await telegram(
-        "editMessageText",
+      await editMessage(
+        chatId,
+        before.progress_message_id,
+        formatSavedText(
+          prepared.result
+        ),
         {
-          chat_id: chatId,
-          message_id:
-            Number(
-              before.progress_message_id
-            ),
-          text:
-            `✅ 归档完成\n\n` +
-            `📄 <b>${escapeHtml(
-              prepared.result.fileName
-            )}</b>\n` +
-            `📁 <code>${escapeHtml(
-              prepared.result.folderPath
-            )}</code>\n` +
-            `🆔 <code>${escapeHtml(
-              prepared.result.customId
-            )}</code>`,
-          parse_mode: "HTML"
+          reply_markup:
+            fileResultKeyboard(
+              prepared.result
+            )
         },
         env
       );
@@ -707,19 +903,33 @@ async function finishSave(
       env
     );
 
-    await sendMessage(
+    if (
+      e?.code === "DUPLICATE"
+    ) {
+      return sendMessage(
+        chatId,
+        `⚠️ <b>这个资源已经存在</b>\n\n` +
+          `没有再次创建索引。\n` +
+          `Telegram 文件本身没有被删除。`,
+        {},
+        env
+      );
+    }
+
+    return sendMessage(
       chatId,
-      e?.code === "DUPLICATE" ||
-      /unique|constraint/i.test(
-        e?.message || ""
-      )
-        ? "文件已存在，已拒绝重复插入。"
-        : "主人，保存失败了。我保留了这个资源，请再选择一次文件夹。",
+      "主人，保存失败了。\n\n" +
+        "我保留了这个资源，请重新选择文件夹。",
       {},
       env
     );
   }
 }
+
+
+// ============================================================
+// Pending encoding
+// ============================================================
 
 function pendingState(resource) {
   if (!resource._pendingToken) {
@@ -734,6 +944,7 @@ function pendingState(resource) {
     )
   );
 }
+
 
 function parsePendingResource(
   state
@@ -751,6 +962,7 @@ function parsePendingResource(
   }
 }
 
+
 async function setPendingResource(
   userId,
   resource,
@@ -763,50 +975,64 @@ async function setPendingResource(
   );
 }
 
+
 async function claimPending(
   userId,
   oldState,
   env
 ) {
-  const r =
+  const result =
     await env.DB.prepare(`
       UPDATE user_states
-      SET state = ?,
-          updated_at = CURRENT_TIMESTAMP
+      SET
+        state = 'auto_archiving',
+        updated_at = CURRENT_TIMESTAMP
       WHERE chat_id = ?
         AND state = ?
     `).bind(
-      "auto_archiving",
       userId,
       oldState
     ).run();
 
   return (
     Number(
-      r.meta?.changes || 0
+      result.meta?.changes || 0
     ) === 1
   );
 }
 
-function extractSingleMediaResource(
-  m
-) {
+
+// ============================================================
+// Media extraction
+// ============================================================
+
+function extractSingleMediaResource(m) {
   if (m.photo) {
     const x =
       m.photo.at(-1);
 
     return {
       type: "file",
-      fileId: x.file_id,
+      mediaKind: "photo",
+
+      fileId:
+        x.file_id,
+
       fileUniqueId:
         x.file_unique_id,
+
       fileName:
         `图片_${m.message_id}.jpg`,
+
       fileSize:
         x.file_size || null,
-      mimeType: "image/jpeg",
+
+      mimeType:
+        "image/jpeg",
+
       caption:
         m.caption || "",
+
       messageId:
         m.message_id
     };
@@ -818,19 +1044,28 @@ function extractSingleMediaResource(
 
     return {
       type: "file",
-      fileId: x.file_id,
+      mediaKind: "document",
+
+      fileId:
+        x.file_id,
+
       fileUniqueId:
         x.file_unique_id,
+
       fileName:
         x.file_name ||
         `文件_${m.message_id}`,
+
       fileSize:
         x.file_size || null,
+
       mimeType:
         x.mime_type ||
         "application/octet-stream",
+
       caption:
         m.caption || "",
+
       messageId:
         m.message_id
     };
@@ -842,19 +1077,61 @@ function extractSingleMediaResource(
 
     return {
       type: "file",
-      fileId: x.file_id,
+      mediaKind: "video",
+
+      fileId:
+        x.file_id,
+
       fileUniqueId:
         x.file_unique_id,
+
       fileName:
         x.file_name ||
         `视频_${m.message_id}.mp4`,
+
       fileSize:
         x.file_size || null,
+
       mimeType:
         x.mime_type ||
         "video/mp4",
+
       caption:
         m.caption || "",
+
+      messageId:
+        m.message_id
+    };
+  }
+
+  if (m.animation) {
+    const x =
+      m.animation;
+
+    return {
+      type: "file",
+      mediaKind: "animation",
+
+      fileId:
+        x.file_id,
+
+      fileUniqueId:
+        x.file_unique_id,
+
+      fileName:
+        x.file_name ||
+        `动画_${m.message_id}.mp4`,
+
+      fileSize:
+        x.file_size || null,
+
+      mimeType:
+        x.mime_type ||
+        "video/mp4",
+
+      caption:
+        m.caption || "",
+
       messageId:
         m.message_id
     };
@@ -866,20 +1143,92 @@ function extractSingleMediaResource(
 
     return {
       type: "file",
-      fileId: x.file_id,
+      mediaKind: "audio",
+
+      fileId:
+        x.file_id,
+
       fileUniqueId:
         x.file_unique_id,
+
       fileName:
         x.file_name ||
         x.title ||
         `音频_${m.message_id}`,
+
       fileSize:
         x.file_size || null,
+
       mimeType:
         x.mime_type ||
         "audio/mpeg",
+
       caption:
         m.caption || "",
+
+      messageId:
+        m.message_id
+    };
+  }
+
+  if (m.voice) {
+    const x =
+      m.voice;
+
+    return {
+      type: "file",
+      mediaKind: "voice",
+
+      fileId:
+        x.file_id,
+
+      fileUniqueId:
+        x.file_unique_id,
+
+      fileName:
+        `语音_${m.message_id}.ogg`,
+
+      fileSize:
+        x.file_size || null,
+
+      mimeType:
+        x.mime_type ||
+        "audio/ogg",
+
+      caption:
+        m.caption || "",
+
+      messageId:
+        m.message_id
+    };
+  }
+
+  if (m.video_note) {
+    const x =
+      m.video_note;
+
+    return {
+      type: "file",
+      mediaKind: "video_note",
+
+      fileId:
+        x.file_id,
+
+      fileUniqueId:
+        x.file_unique_id,
+
+      fileName:
+        `视频消息_${m.message_id}.mp4`,
+
+      fileSize:
+        x.file_size || null,
+
+      mimeType:
+        "video/mp4",
+
+      caption:
+        m.caption || "",
+
       messageId:
         m.message_id
     };
@@ -887,6 +1236,47 @@ function extractSingleMediaResource(
 
   return null;
 }
+
+
+function extractMediaGroupItem(m) {
+  const x =
+    extractSingleMediaResource(m);
+
+  if (!x) {
+    return null;
+  }
+
+  return {
+    kind:
+      x.mediaKind,
+
+    fileId:
+      x.fileId,
+
+    fileUniqueId:
+      x.fileUniqueId,
+
+    fileName:
+      x.fileName,
+
+    fileSize:
+      x.fileSize,
+
+    mimeType:
+      x.mimeType,
+
+    caption:
+      x.caption,
+
+    messageId:
+      x.messageId
+  };
+}
+
+
+// ============================================================
+// Media group
+// ============================================================
 
 async function handleMediaGroupItem(
   m,
@@ -897,10 +1287,14 @@ async function handleMediaGroupItem(
   const item =
     extractMediaGroupItem(m);
 
-  if (!item) return;
+  if (!item) {
+    return;
+  }
 
   const groupId =
-    String(m.media_group_id);
+    String(
+      m.media_group_id
+    );
 
   const state =
     await getStateRecord(
@@ -912,9 +1306,7 @@ async function handleMediaGroupItem(
     state?.state ===
     "auto_archiving"
   ) {
-    await new Promise(
-      r => setTimeout(r, 25)
-    );
+    await sleep(30);
 
     return handleMediaGroupItem(
       m,
@@ -950,9 +1342,10 @@ async function handleMediaGroupItem(
       );
     }
 
-    if (state.last_folder_id) {
-      const old = resource;
-
+    if (
+      resource &&
+      state.last_folder_id
+    ) {
       const claimed =
         await claimPending(
           userId,
@@ -960,11 +1353,11 @@ async function handleMediaGroupItem(
           env
         );
 
-      if (claimed && old) {
-        await saveAndReplacePending(
+      if (claimed) {
+        return saveAndReplacePending(
           userId,
           chatId,
-          old,
+          resource,
           Number(
             state.last_folder_id
           ),
@@ -974,10 +1367,8 @@ async function handleMediaGroupItem(
           ),
           env
         );
-
-        return;
       }
-    } else {
+    } else if (resource) {
       await sendMessage(
         chatId,
         "还有一个资源正在等待整理，请先选择文件夹。",
@@ -1001,12 +1392,48 @@ async function handleMediaGroupItem(
     env
   );
 
-  await chooseFolderForUpload(
-    userId,
-    chatId,
-    env
+  /*
+   * 不立即把媒体组判定为完整。
+   *
+   * Telegram 的 album 是多个 update。
+   * 后续 update 会继续 append。
+   */
+  await sleep(
+    MEDIA_GROUP_WAIT
   );
+
+  const latest =
+    await getStateRecord(
+      userId,
+      env
+    );
+
+  if (
+    latest?.state?.startsWith(
+      "pending_resource:"
+    )
+  ) {
+    const current =
+      parsePendingResource(
+        latest.state
+      );
+
+    if (
+      current?.type ===
+        "media_group" &&
+      String(
+        current.mediaGroupId
+      ) === groupId
+    ) {
+      return chooseFolderForUpload(
+        userId,
+        chatId,
+        env
+      );
+    }
+  }
 }
+
 
 function makeMediaGroup(
   groupId,
@@ -1014,46 +1441,17 @@ function makeMediaGroup(
 ) {
   return {
     type: "media_group",
-    mediaGroupId: groupId,
+
+    mediaGroupId:
+      groupId,
+
     items: [item],
-    createdAt: Date.now()
+
+    createdAt:
+      Date.now()
   };
 }
 
-function extractMediaGroupItem(
-  m
-) {
-  const x =
-    extractSingleMediaResource(m);
-
-  if (!x) return null;
-
-  return {
-    kind:
-      x.mimeType.startsWith(
-        "image/"
-      )
-        ? "photo"
-        : x.mimeType.startsWith(
-            "video/"
-          )
-          ? "video"
-          : x.mimeType.startsWith(
-              "audio/"
-            )
-            ? "audio"
-            : "document",
-
-    fileId: x.fileId,
-    fileUniqueId:
-      x.fileUniqueId,
-    fileName: x.fileName,
-    fileSize: x.fileSize,
-    mimeType: x.mimeType,
-    caption: x.caption,
-    messageId: x.messageId
-  };
-}
 
 async function appendMediaGroupItem(
   userId,
@@ -1062,6 +1460,13 @@ async function appendMediaGroupItem(
   item,
   env
 ) {
+  /*
+   * 媒体组内部：
+   * 同一个 message_id 只允许出现一次。
+   *
+   * 不使用 file_unique_id 去重整个媒体组。
+   * 因为同一个媒体可能合法地出现在不同位置。
+   */
   if (
     resource.items.some(
       x =>
@@ -1069,7 +1474,7 @@ async function appendMediaGroupItem(
         String(item.messageId)
     )
   ) {
-    return true;
+    return;
   }
 
   resource.items.push(item);
@@ -1083,11 +1488,12 @@ async function appendMediaGroupItem(
   const next =
     pendingState(resource);
 
-  const r =
+  const result =
     await env.DB.prepare(`
       UPDATE user_states
-      SET state = ?,
-          updated_at = CURRENT_TIMESTAMP
+      SET
+        state = ?,
+        updated_at = CURRENT_TIMESTAMP
       WHERE chat_id = ?
         AND state = ?
     `).bind(
@@ -1098,10 +1504,10 @@ async function appendMediaGroupItem(
 
   if (
     Number(
-      r.meta?.changes || 0
+      result.meta?.changes || 0
     ) === 1
   ) {
-    return true;
+    return;
   }
 
   const latest =
@@ -1115,21 +1521,29 @@ async function appendMediaGroupItem(
       "pending_resource:"
     )
   ) {
-    return appendMediaGroupItem(
-      userId,
-      latest,
+    const latestResource =
       parsePendingResource(
         latest
-      ),
-      item,
-      env
-    );
-  }
+      );
 
-  return true;
+    if (
+      latestResource
+    ) {
+      return appendMediaGroupItem(
+        userId,
+        latest,
+        latestResource,
+        item,
+        env
+      );
+    }
+  }
 }
 
-/* -------------------- Folder picker -------------------- */
+
+// ============================================================
+// Upload folder picker
+// ============================================================
 
 async function chooseFolderForUpload(
   userId,
@@ -1140,14 +1554,17 @@ async function chooseFolderForUpload(
     userId,
     chatId,
     null,
+    null,
     env
   );
 }
+
 
 async function showUploadFolders(
   userId,
   chatId,
   parentId,
+  editMessageId,
   env
 ) {
   const folders =
@@ -1162,61 +1579,120 @@ async function showUploadFolders(
   for (const f of folders) {
     buttons.push([
       {
-        text: `📥 ${f.name}`,
+        text:
+          `📥 ${truncate(
+            f.name,
+            24
+          )}`,
         callback_data:
           `uploadhere:${f.id}`
       },
       {
-        text: "📂 进入",
+        text: "📂",
         callback_data:
           `uploadbrowse:${f.id}`
       }
     ]);
   }
 
-  if (parentId !== null) {
+  if (
+    parentId !== null
+  ) {
     buttons.push([
       {
-        text: "📥 保存到当前文件夹",
+        text:
+          "📥 保存到当前文件夹",
         callback_data:
           `uploadhere:${parentId}`
       }
     ]);
 
-    const f =
+    const folder =
       await getFolder(
         userId,
         parentId,
         env
       );
 
-    if (f?.parent_id !== null) {
+    if (
+      folder?.parent_id !== null
+    ) {
       buttons.push([
         {
-          text: "⬆️ 上一级",
+          text:
+            "⬆️ 上一级",
           callback_data:
-            `uploadbrowse:${f.parent_id}`
+            `uploadbrowse:${folder.parent_id}`
         }
       ]);
     }
   }
 
-  await sendMessage(
-    chatId,
-    parentId === null
-      ? "主人，这个资源准备放在哪里呢？"
-      : "主人，可以直接保存到当前文件夹，也可以进入子文件夹。",
+  buttons.push([
     {
-      reply_markup: {
-        inline_keyboard:
-          buttons
-      }
-    },
+      text:
+        "🏠 根目录",
+      callback_data:
+        "uploadbrowse:root"
+    }
+  ]);
+
+  const text =
+    parentId === null
+      ? "📥 <b>选择保存位置</b>\n\n" +
+        "选择文件夹即可归档这个资源。"
+      : `📥 <b>选择保存位置</b>\n\n` +
+        `当前：<code>${escapeHtml(
+          await getFolderPath(
+            userId,
+            parentId,
+            env
+          )
+        )}</code>`;
+
+  const options = {
+    reply_markup: {
+      inline_keyboard:
+        buttons
+    }
+  };
+
+  if (editMessageId) {
+    const result =
+      await editMessage(
+        chatId,
+        editMessageId,
+        text,
+        options,
+        env
+      );
+
+    if (
+      !result.ok
+    ) {
+      return sendMessage(
+        chatId,
+        text,
+        options,
+        env
+      );
+    }
+
+    return result;
+  }
+
+  return sendMessage(
+    chatId,
+    text,
+    options,
     env
   );
 }
 
-/* -------------------- Callback -------------------- */
+
+// ============================================================
+// Callback
+// ============================================================
 
 async function handleCallback(
   q,
@@ -1226,30 +1702,163 @@ async function handleCallback(
     String(q.from.id);
 
   const chatId =
-    String(q.message.chat.id);
+    String(
+      q.message?.chat?.id
+    );
+
+  const messageId =
+    q.message?.message_id;
 
   const data =
-    String(q.data || "");
+    String(
+      q.data || ""
+    );
 
-  await telegram(
-    "answerCallbackQuery",
-    {
-      callback_query_id: q.id
-    },
+  await answerCallback(
+    q.id,
+    "",
+    false,
     env
   );
+
+  // ----------------------------------------------------------
+  // Home
+  // ----------------------------------------------------------
+
+  if (
+    data === "home:recent"
+  ) {
+    return showRecentFiles(
+      userId,
+      chatId,
+      0,
+      env,
+      messageId
+    );
+  }
+
+  if (
+    data === "home:folders"
+  ) {
+    return showFolderRoot(
+      userId,
+      chatId,
+      0,
+      env,
+      messageId
+    );
+  }
+
+  if (
+    data === "home:search"
+  ) {
+    await setState(
+      userId,
+      "search",
+      env
+    );
+
+    return editMessage(
+      chatId,
+      messageId,
+      "🔎 <b>搜索资源</b>\n\n" +
+        "请输入文件名、ID 或关键词。",
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              {
+                text:
+                  "🏠 返回首页",
+                callback_data:
+                  "home:back"
+              }
+            ]
+          ]
+        }
+      },
+      env
+    );
+  }
+
+  if (
+    data === "home:help"
+  ) {
+    return editMessage(
+      chatId,
+      messageId,
+      `<b>${BOT_NAME} 文件管家</b>\n\n` +
+        `直接发送文件即可归档。\n\n` +
+        `📁 创建 游戏/FGO\n` +
+        `📂 打开 游戏/FGO\n` +
+        `🔎 搜索 FGO\n` +
+        `📤 取出资源\n` +
+        `🆔 修改 ID\n` +
+        `📂 移动到其他文件夹`,
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              {
+                text:
+                  "🏠 首页",
+                callback_data:
+                  "home:back"
+              }
+            ]
+          ]
+        }
+      },
+      env
+    );
+  }
+
+  if (
+    data === "home:back"
+  ) {
+    await clearState(
+      userId,
+      env
+    );
+
+    return editMessage(
+      chatId,
+      messageId,
+      `<b>${BOT_NAME} 文件管家</b>\n\n` +
+        `欢迎回来，主人。\n` +
+        `选择一个功能开始管理文件库。`,
+      {
+        reply_markup:
+          homeKeyboard()
+      },
+      env
+    );
+  }
+
+  // ----------------------------------------------------------
+  // Upload picker
+  // ----------------------------------------------------------
 
   if (
     data.startsWith(
       "uploadbrowse:"
     )
   ) {
+    const raw =
+      data.slice(
+        "uploadbrowse:".length
+      );
+
+    const parentId =
+      raw === "root"
+        ? null
+        : Number(raw);
+
     return showUploadFolders(
       userId,
       chatId,
-      Number(
-        data.slice(13)
-      ),
+      parentId,
+      messageId,
       env
     );
   }
@@ -1259,102 +1868,104 @@ async function handleCallback(
       "uploadhere:"
     )
   ) {
-    const folderId =
-      Number(
-        data.slice(11)
-      );
-
-    const state =
-      await getState(
-        userId,
-        env
-      );
-
-    const resource =
-      state?.startsWith(
-        "pending_resource:"
-      )
-        ? parsePendingResource(
-            state
-          )
-        : null;
-
-    if (!resource) {
-      return sendMessage(
-        chatId,
-        "这个待整理资源已经处理过了，请重新发送。",
-        {},
-        env
-      );
-    }
-
-    if (
-      !(await getFolder(
-        userId,
-        folderId,
-        env
-      ))
-    ) {
-      return sendMessage(
-        chatId,
-        "这个文件夹已经不存在了。",
-        {},
-        env
-      );
-    }
-
-    const claimed =
-      await claimPending(
-        userId,
-        state,
-        env
-      );
-
-    if (!claimed) {
-      return sendMessage(
-        chatId,
-        "这个资源已经被另一条消息处理了。",
-        {},
-        env
-      );
-    }
-
-    return finishSave(
+    return handleUploadHere(
       userId,
       chatId,
-      resource,
-      folderId,
-      env
-    );
-  }
-
-  if (data === "noop") {
-    return;
-  }
-
-  if (
-    data.startsWith("folder:")
-  ) {
-    return showFolder(
-      userId,
-      chatId,
+      messageId,
       Number(
-        data.slice(7)
+        data.slice(
+          "uploadhere:".length
+        )
       ),
       env
     );
   }
 
+  // ----------------------------------------------------------
+  // Folder navigation
+  // ----------------------------------------------------------
+
   if (
-    data.startsWith("file:")
+    data.startsWith(
+      "folder:"
+    )
+  ) {
+    const parts =
+      data.split(":");
+
+    const folderId =
+      Number(parts[1]);
+
+    const page =
+      Number(parts[2] || 0);
+
+    return showFolder(
+      userId,
+      chatId,
+      folderId,
+      page,
+      env,
+      messageId
+    );
+  }
+
+  if (
+    data ===
+    "folderroot"
+  ) {
+    return showFolderRoot(
+      userId,
+      chatId,
+      0,
+      env,
+      messageId
+    );
+  }
+
+  // ----------------------------------------------------------
+  // Recent
+  // ----------------------------------------------------------
+
+  if (
+    data.startsWith(
+      "recent:"
+    )
+  ) {
+    const page =
+      Number(
+        data.slice(
+          "recent:".length
+        )
+      );
+
+    return showRecentFiles(
+      userId,
+      chatId,
+      page,
+      env,
+      messageId
+    );
+  }
+
+  // ----------------------------------------------------------
+  // File
+  // ----------------------------------------------------------
+
+  if (
+    data.startsWith(
+      "file:"
+    )
   ) {
     return showFile(
       userId,
       chatId,
       Number(
-        data.slice(5)
+        data.slice(
+          "file:".length
+        )
       ),
-      env
+      env,
+      messageId
     );
   }
 
@@ -1366,8 +1977,10 @@ async function handleCallback(
     return navigateFile(
       userId,
       chatId,
-      decodeURIComponent(
-        data.slice(9)
+      Number(
+        data.slice(
+          "prevfile:".length
+        )
       ),
       -1,
       env
@@ -1382,8 +1995,10 @@ async function handleCallback(
     return navigateFile(
       userId,
       chatId,
-      decodeURIComponent(
-        data.slice(9)
+      Number(
+        data.slice(
+          "nextfile:".length
+        )
       ),
       1,
       env
@@ -1399,7 +2014,62 @@ async function handleCallback(
       userId,
       chatId,
       Number(
-        data.slice(9)
+        data.slice(
+          "sendfile:".length
+        )
+      ),
+      env
+    );
+  }
+
+  // ----------------------------------------------------------
+  // Custom ID
+  // ----------------------------------------------------------
+
+  if (
+    data.startsWith(
+      "customid:"
+    )
+  ) {
+    const id =
+      Number(
+        data.slice(
+          "customid:".length
+        )
+      );
+
+    await setState(
+      userId,
+      `rename_file:${id}`,
+      env
+    );
+
+    return sendMessage(
+      chatId,
+      "主人想把它改成什么 ID？\n\n" +
+        "例如：<code>FGO-攻略-001</code>",
+      {},
+      env
+    );
+  }
+
+  // ----------------------------------------------------------
+  // Delete
+  // ----------------------------------------------------------
+
+  if (
+    data.startsWith(
+      "deletefile:"
+    )
+  ) {
+    return confirmDelete(
+      userId,
+      chatId,
+      messageId,
+      Number(
+        data.slice(
+          "deletefile:".length
+        )
       ),
       env
     );
@@ -1407,51 +2077,36 @@ async function handleCallback(
 
   if (
     data.startsWith(
-      "customid:"
+      "delete_confirm:"
     )
   ) {
-    await setState(
+    return deleteFile(
       userId,
-      `rename_file:${Number(
-        data.slice(9)
-      )}`,
-      env
-    );
-
-    return sendMessage(
       chatId,
-      "主人想把它改成什么 ID？\n例如：<code>FGO-攻略-001</code>",
-      {},
+      Number(
+        data.slice(
+          "delete_confirm:".length
+        )
+      ),
       env
     );
   }
 
   if (
-    data.startsWith(
-      "deletefile:"
-    )
+    data ===
+    "delete_cancel"
   ) {
-    const id =
-      Number(
-        data.slice(11)
-      );
-
-    await env.DB.prepare(`
-      DELETE FROM files
-      WHERE id = ?
-        AND user_id = ?
-    `).bind(
-      id,
-      userId
-    ).run();
-
     return sendMessage(
       chatId,
-      "已经帮主人删除这个资源的索引了。\nTelegram 中原文件不会被删除。",
+      "删除操作已取消。",
       {},
       env
     );
   }
+
+  // ----------------------------------------------------------
+  // Move
+  // ----------------------------------------------------------
 
   if (
     data.startsWith(
@@ -1462,7 +2117,9 @@ async function handleCallback(
       userId,
       chatId,
       Number(
-        data.slice(11)
+        data.slice(
+          "move_start:".length
+        )
       ),
       env
     );
@@ -1473,12 +2130,21 @@ async function handleCallback(
       "move_browse:"
     )
   ) {
+    const raw =
+      data.slice(
+        "move_browse:".length
+      );
+
+    const folderId =
+      raw === "root"
+        ? null
+        : Number(raw);
+
     return showMoveFolders(
       userId,
       chatId,
-      Number(
-        data.slice(12)
-      ),
+      folderId,
+      messageId,
       env
     );
   }
@@ -1491,25 +2157,17 @@ async function handleCallback(
     return moveHere(
       userId,
       chatId,
-      data.slice(10),
+      data.slice(
+        "move_here:".length
+      ),
       env
     );
   }
 
   if (
-    data.startsWith(
-      "move_confirm:"
-    )
+    data ===
+    "move_cancel"
   ) {
-    return moveHere(
-      userId,
-      chatId,
-      data.slice(13),
-      env
-    );
-  }
-
-  if (data === "move_cancel") {
     await clearState(
       userId,
       env
@@ -1522,169 +2180,63 @@ async function handleCallback(
       env
     );
   }
-}
 
-async function startMove(
-  userId,
-  chatId,
-  fileId,
-  env
-) {
-  if (
-    !(await getFile(
-      userId,
-      fileId,
-      env
-    ))
-  ) {
-    return sendMessage(
-      chatId,
-      "这个资源不存在。",
-      {},
-      env
-    );
-  }
-
-  await setState(
-    userId,
-    `moving:${fileId}`,
-    env
-  );
-
-  return showMoveFolders(
-    userId,
-    chatId,
-    null,
-    env
-  );
-}
-
-async function showMoveFolders(
-  userId,
-  chatId,
-  parentId,
-  env
-) {
-  const folders =
-    await queryFolders(
-      userId,
-      parentId,
-      env
-    );
-
-  const buttons = [];
-
-  for (const f of folders) {
-    buttons.push([
-      {
-        text: `📥 ${f.name}`,
-        callback_data:
-          `move_here:${f.id}`
-      },
-      {
-        text: "📂 进入",
-        callback_data:
-          `move_browse:${f.id}`
-      }
-    ]);
-  }
-
-  if (parentId !== null) {
-    const f =
-      await getFolder(
-        userId,
-        parentId,
-        env
-      );
-
-    if (f?.parent_id !== null) {
-      buttons.push([
-        {
-          text: "⬆️ 上一级",
-          callback_data:
-            `move_browse:${f.parent_id}`
-        }
-      ]);
-    }
-
-    buttons.push([
-      {
-        text: "📥 就移到这里",
-        callback_data:
-          `move_confirm:${parentId}`
-      }
-    ]);
-  }
-
-  buttons.push([
-    {
-      text: "📥 移到根目录",
-      callback_data:
-        "move_here:root"
-    },
-    {
-      text: "取消",
-      callback_data:
-        "move_cancel"
-    }
-  ]);
-
-  return sendMessage(
-    chatId,
-    "请选择目标文件夹：",
-    {
-      reply_markup: {
-        inline_keyboard:
-          buttons
-      }
-    },
-    env
-  );
-}
-
-async function moveHere(
-  userId,
-  chatId,
-  target,
-  env
-) {
-  const state =
-    await getState(
-      userId,
-      env
-    );
+  // ----------------------------------------------------------
+  // Search
+  // ----------------------------------------------------------
 
   if (
-    !state?.startsWith(
-      "moving:"
+    data.startsWith(
+      "search:"
     )
   ) {
-    return sendMessage(
+    const encoded =
+      data.slice(
+        "search:".length
+      );
+
+    const [keyword, page] =
+      decodeURIComponent(
+        encoded
+      ).split("|");
+
+    return searchFiles(
+      userId,
       chatId,
-      "移动操作已失效，请重新选择。",
-      {},
-      env
+      keyword,
+      Number(page || 0),
+      env,
+      messageId
     );
   }
 
-  const fileId =
-    Number(
-      state.slice(7)
-    );
-
-  const folderId =
-    target === "root"
-      ? null
-      : Number(target);
-
   if (
-    folderId !== null &&
-    !(await getFolder(
+    data === "noop"
+  ) {
+    return;
+  }
+}
+
+
+// ============================================================
+// Upload
+// ============================================================
+
+async function handleUploadHere(
+  userId,
+  chatId,
+  messageId,
+  folderId,
+  env
+) {
+  const folder =
+    await getFolder(
       userId,
       folderId,
       env
-    ))
-  ) {
+    );
+
+  if (!folder) {
     return sendMessage(
       chatId,
       "这个文件夹已经不存在了。",
@@ -1693,54 +2245,164 @@ async function moveHere(
     );
   }
 
-  await env.DB.prepare(`
-    UPDATE files
-    SET folder_id = ?
-    WHERE id = ?
-      AND user_id = ?
-  `).bind(
-    folderId,
-    fileId,
-    userId
-  ).run();
-
-  await clearState(
-    userId,
-    env
-  );
-
-  const file =
-    await getFile(
+  const state =
+    await getState(
       userId,
-      fileId,
       env
     );
 
-  const path =
-    folderId
-      ? await getFolderPath(
-          userId,
-          folderId,
-          env
+  const resource =
+    state?.startsWith(
+      "pending_resource:"
+    )
+      ? parsePendingResource(
+          state
         )
-      : "根目录";
+      : null;
+
+  if (!resource) {
+    return sendMessage(
+      chatId,
+      "这个待整理资源已经处理过了，请重新发送。",
+      {},
+      env
+    );
+  }
+
+  const claimed =
+    await claimPending(
+      userId,
+      state,
+      env
+    );
+
+  if (!claimed) {
+    return sendMessage(
+      chatId,
+      "这个资源已经被另一条操作处理了。",
+      {},
+      env
+    );
+  }
+
+  return finishSave(
+    userId,
+    chatId,
+    resource,
+    folderId,
+    env
+  );
+}
+
+
+// ============================================================
+// Delete
+// ============================================================
+
+async function confirmDelete(
+  userId,
+  chatId,
+  messageId,
+  id,
+  env
+) {
+  const f =
+    await getFile(
+      userId,
+      id,
+      env
+    );
+
+  if (!f) {
+    return sendMessage(
+      chatId,
+      "这个资源已经不存在了。",
+      {},
+      env
+    );
+  }
+
+  return editMessage(
+    chatId,
+    messageId,
+    `🗑 <b>确认删除？</b>\n\n` +
+      `${getResourceIcon(
+        f.mime_type
+      )} ${escapeHtml(
+        f.file_name
+      )}\n` +
+      `🆔 <code>${escapeHtml(
+        f.custom_id || ""
+      )}</code>\n\n` +
+      `这里只会删除文件库中的索引，` +
+      `不会删除 Telegram 中的原文件。`,
+    {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            {
+              text:
+                "🗑 确认删除",
+              callback_data:
+                `delete_confirm:${id}`
+            },
+            {
+              text:
+                "取消",
+              callback_data:
+                "delete_cancel"
+            }
+          ]
+        ]
+      }
+    },
+    env
+  );
+}
+
+
+async function deleteFile(
+  userId,
+  chatId,
+  id,
+  env
+) {
+  const result =
+    await env.DB.prepare(`
+      DELETE FROM files
+      WHERE id = ?
+        AND user_id = ?
+    `).bind(
+      id,
+      userId
+    ).run();
+
+  if (
+    Number(
+      result.meta?.changes || 0
+    ) !== 1
+  ) {
+    return sendMessage(
+      chatId,
+      "这个资源已经不存在了。",
+      {},
+      env
+    );
+  }
 
   return sendMessage(
     chatId,
-    `好的，主人。\n\n` +
-      `📄 ${escapeHtml(
-        file?.file_name ||
-        "资源"
-      )}\n` +
-      `📁 已移动到：<code>${escapeHtml(
-        path
-      )}</code>`,
+    "🗑 已删除这个资源的索引。\n\n" +
+      "Telegram 中的原文件不会受到影响。",
     {},
     env
   );
 }
 
-/* -------------------- Save / duplicate / IDs -------------------- */
+
+// ============================================================
+// Save / Dedup
+// ============================================================
 
 async function saveResource(
   userId,
@@ -1756,12 +2418,31 @@ async function saveResource(
       env
     );
 
-  await env.DB.batch([
-    prepared.statement
-  ]);
+  try {
+    await env.DB.batch([
+      prepared.statement
+    ]);
+  } catch (e) {
+    if (
+      isUniqueConstraintError(e)
+    ) {
+      const err =
+        new Error(
+          "DUPLICATE"
+        );
+
+      err.code =
+        "DUPLICATE";
+
+      throw err;
+    }
+
+    throw e;
+  }
 
   return prepared.result;
 }
+
 
 async function prepareSave(
   userId,
@@ -1782,149 +2463,246 @@ async function prepareSave(
     );
   }
 
-  let stored;
+  let fileId;
   let fileUniqueId;
   let fileName;
   let fileSize = null;
   let mimeType;
 
-  const type =
-    resource.type;
-
   let photoCount = 0;
   let videoCount = 0;
+  let audioCount = 0;
   let documentCount = 0;
 
-  if (resource.type === "file") {
-    fileUniqueId =
-      resource.fileUniqueId ||
-      `file:${resource.fileId}`;
+  // ----------------------------------------------------------
+  // Ordinary file
+  // ----------------------------------------------------------
 
+  if (
+    resource.type ===
+    "file"
+  ) {
     fileName =
-      deriveName(resource);
+      deriveName(
+        resource
+      );
 
     fileSize =
-      resource.fileSize;
+      resource.fileSize ||
+      null;
 
     mimeType =
-      resource.mimeType;
-  } else if (
+      resource.mimeType ||
+      "application/octet-stream";
+
+    fileId =
+      resource.fileId;
+
+    fileUniqueId =
+      buildFileDedupeKey(
+        resource
+      );
+
+    if (!fileUniqueId) {
+      throw new Error(
+        "Missing Telegram file identity"
+      );
+    }
+  }
+
+  // ----------------------------------------------------------
+  // Media group
+  // ----------------------------------------------------------
+
+  else if (
     resource.type ===
     "media_group"
   ) {
-    resource.items =
-      uniqueBy(
-        resource.items,
-        x =>
-          x.fileUniqueId ||
-          x.messageId
+    const items =
+      normalizeMediaGroupItems(
+        resource.items
       );
 
-    resource.items.sort(
-      (a, b) =>
-        Number(a.messageId) -
-        Number(b.messageId)
-    );
+    if (!items.length) {
+      throw new Error(
+        "Empty media group"
+      );
+    }
+
+    resource.items =
+      items;
 
     photoCount =
-      resource.items.filter(
+      items.filter(
         x =>
           x.kind === "photo"
       ).length;
 
     videoCount =
-      resource.items.filter(
+      items.filter(
         x =>
-          x.kind === "video"
+          x.kind === "video" ||
+          x.kind === "animation" ||
+          x.kind === "video_note"
+      ).length;
+
+    audioCount =
+      items.filter(
+        x =>
+          x.kind === "audio" ||
+          x.kind === "voice"
       ).length;
 
     documentCount =
-      resource.items.filter(
+      items.filter(
         x =>
           x.kind === "document"
       ).length;
 
-    fileUniqueId =
-      "media_group:" +
-      resource.items
-        .map(
-          x =>
-            x.fileUniqueId ||
-            x.fileId
-        )
-        .sort()
-        .join("|");
+    /*
+     * 关键：
+     *
+     * 不再：
+     *
+     *   sort(fileUniqueId).join()
+     *
+     * 因为这会丢失媒体组的顺序。
+     *
+     * 也不使用 media_group_id，
+     * 因为它只代表这一批消息，
+     * 不能作为长期文件身份。
+     */
+    const identities =
+      items.map(
+        (x, index) =>
+          `${index}:${mediaItemIdentity(x)}`
+      );
 
-    stored =
+    fileUniqueId =
+      `album:v2:${identities.join("|")}`;
+
+    fileId =
       JSON.stringify({
-        type: "media_group",
+        type:
+          "media_group",
+
         mediaGroupId:
           resource.mediaGroupId,
-        items:
-          resource.items,
+
+        items,
+
         createdAt:
           resource.createdAt ||
           Date.now()
       });
 
+    fileName =
+      deriveName(
+        resource
+      );
+
     mimeType =
       "media/media_group";
 
     fileSize =
-      resource.items.reduce(
-        (s, x) =>
-          s +
+      items.reduce(
+        (sum, x) =>
+          sum +
           Number(
             x.fileSize || 0
           ),
         0
       ) || null;
+  }
+
+  // ----------------------------------------------------------
+  // Link
+  // ----------------------------------------------------------
+
+  else if (
+    resource.type ===
+    "link"
+  ) {
+    const normalized =
+      normalizeUrl(
+        resource.url
+      );
+
+    if (!normalized) {
+      throw new Error(
+        "Invalid URL"
+      );
+    }
+
+    /*
+     * 原代码：
+     *
+     * link:${messageId}
+     *
+     * 导致同一个 URL 每次发送
+     * 都被认为是新资源。
+     *
+     * 现在使用规范化 URL。
+     */
+    fileUniqueId =
+      `link:v2:${normalized}`;
+
+    fileId =
+      JSON.stringify({
+        type: "link",
+        url:
+          resource.url,
+        text:
+          resource.text,
+        messageId:
+          resource.messageId
+      });
 
     fileName =
-      deriveName(resource);
-  } else if (
-    resource.type === "link"
-  ) {
-    fileUniqueId =
-      `link:${
-        resource.messageId ||
-        Date.now()
-      }`;
-
-    stored =
-      JSON.stringify(resource);
+      deriveName(
+        resource
+      );
 
     mimeType =
       "text/link";
+  }
 
-    fileName =
-      deriveName(resource);
-  } else {
+  else {
     throw new Error(
       "Unknown resource type"
     );
   }
 
-  const dup =
-    await env.DB.prepare(`
-      SELECT id, custom_id
-      FROM files
-      WHERE user_id = ?
-        AND file_unique_id = ?
-      LIMIT 1
-    `).bind(
+  // ----------------------------------------------------------
+  // Application-level duplicate check
+  // ----------------------------------------------------------
+
+  const duplicate =
+    await findDuplicate(
       userId,
-      fileUniqueId
-    ).first();
+      resource,
+      fileUniqueId,
+      env
+    );
 
-  if (dup) {
+  if (duplicate) {
     const e =
-      new Error("DUPLICATE");
+      new Error(
+        "DUPLICATE"
+      );
 
-    e.code = "DUPLICATE";
+    e.code =
+      "DUPLICATE";
+
+    e.duplicateId =
+      duplicate.id;
 
     throw e;
   }
+
+  // ----------------------------------------------------------
+  // Custom ID
+  // ----------------------------------------------------------
 
   const customId =
     await generateCustomId(
@@ -1933,11 +2711,6 @@ async function prepareSave(
       folder.name,
       env
     );
-
-  const fileId =
-    resource.type === "file"
-      ? resource.fileId
-      : stored;
 
   const statement =
     env.DB.prepare(`
@@ -1963,28 +2736,227 @@ async function prepareSave(
       folderId
     );
 
-  const result = {
-    type,
-    fileName,
-    customId,
-    folderPath:
-      await getFolderPath(
-        userId,
-        folder.id,
-        env
-      ),
-    count:
-      resource.items?.length,
-    photoCount,
-    videoCount,
-    documentCount
-  };
-
   return {
     statement,
-    result
+
+    result: {
+      type:
+        resource.type,
+
+      fileId,
+
+      fileName,
+
+      customId,
+
+      folderId:
+
+        folder.id,
+
+      folderPath:
+        await getFolderPath(
+          userId,
+          folder.id,
+          env
+        ),
+
+      count:
+        resource.items?.length ||
+        null,
+
+      photoCount,
+
+      videoCount,
+
+      audioCount,
+
+      documentCount
+    }
   };
 }
+
+
+// ============================================================
+// Deduplication
+// ============================================================
+
+function buildFileDedupeKey(
+  resource
+) {
+  const kind =
+    resource.mediaKind ||
+    inferMediaKind(
+      resource.mimeType
+    );
+
+  const unique =
+    cleanIdentity(
+      resource.fileUniqueId
+    );
+
+  if (unique) {
+    return (
+      `tg:v2:${kind}:${unique}`
+    );
+  }
+
+  /*
+   * file_id 可以用于重新发送，
+   * 但 Telegram 官方说明：
+   * 同一文件可能有不同 file_id。
+   *
+   * 因此它只能作为缺少 file_unique_id
+   * 时的 fallback。
+   */
+  const fileId =
+    cleanIdentity(
+      resource.fileId
+    );
+
+  if (fileId) {
+    return (
+      `tg:fileid:${kind}:${fileId}`
+    );
+  }
+
+  /*
+   * 最后 fallback 才使用 message_id。
+   *
+   * message_id 永远不是文件身份。
+   */
+  if (
+    resource.messageId != null
+  ) {
+    return (
+      `tg:message:${kind}:${resource.messageId}`
+    );
+  }
+
+  return null;
+}
+
+
+function mediaItemIdentity(item) {
+  const kind =
+    item.kind ||
+    inferMediaKind(
+      item.mimeType
+    );
+
+  const unique =
+    cleanIdentity(
+      item.fileUniqueId
+    );
+
+  if (unique) {
+    return `${kind}:${unique}`;
+  }
+
+  const fileId =
+    cleanIdentity(
+      item.fileId
+    );
+
+  if (fileId) {
+    return `${kind}:fileid:${fileId}`;
+  }
+
+  return `${kind}:message:${item.messageId}`;
+}
+
+
+async function findDuplicate(
+  userId,
+  resource,
+  key,
+  env
+) {
+  if (!key) {
+    return null;
+  }
+
+  const current =
+    await env.DB.prepare(`
+      SELECT
+        id,
+        custom_id,
+        file_name,
+        folder_id
+      FROM files
+      WHERE user_id = ?
+        AND file_unique_id = ?
+      LIMIT 1
+    `).bind(
+      userId,
+      key
+    ).first();
+
+  if (current) {
+    return current;
+  }
+
+  /*
+   * 兼容旧版本数据库。
+   *
+   * 旧代码保存的是：
+   *
+   *   raw file_unique_id
+   *
+   * 新代码保存：
+   *
+   *   tg:v2:type:file_unique_id
+   *
+   * 因此第一次升级时，
+   * 再尝试一次旧格式。
+   */
+  if (
+    resource.type ===
+    "file"
+  ) {
+    const raw =
+      cleanIdentity(
+        resource.fileUniqueId
+      );
+
+    if (raw) {
+      const legacy =
+        await env.DB.prepare(`
+          SELECT
+            id,
+            custom_id,
+            file_name,
+            folder_id
+          FROM files
+          WHERE user_id = ?
+            AND file_unique_id = ?
+          LIMIT 1
+        `).bind(
+          userId,
+          raw
+        ).first();
+
+      if (legacy) {
+        return legacy;
+      }
+    }
+  }
+
+  return null;
+}
+
+
+function isUniqueConstraintError(e) {
+  return /unique|constraint/i.test(
+    String(
+      e?.message || ""
+    )
+  );
+}
+
+
+// ============================================================
+// Custom ID
+// ============================================================
 
 async function generateCustomId(
   userId,
@@ -1997,101 +2969,92 @@ async function generateCustomId(
       folderName
     );
 
-  const r =
-    await env.DB.prepare(`
-      SELECT custom_id
-      FROM files
-      WHERE user_id = ?
-        AND folder_id = ?
-    `).bind(
-      userId,
-      folderId
-    ).all();
+  const rows =
+    (
+      await env.DB.prepare(`
+        SELECT custom_id
+        FROM files
+        WHERE user_id = ?
+          AND folder_id = ?
+      `).bind(
+        userId,
+        folderId
+      ).all()
+    ).results || [];
 
   let max = 0;
 
-  for (
-    const x of
-    r.results || []
-  ) {
-    const m =
+  const pattern =
+    new RegExp(
+      "^" +
+        escapeRegExp(
+          prefix
+        ) +
+        "-(\\d+)$"
+    );
+
+  for (const row of rows) {
+    const match =
       String(
-        x.custom_id || ""
+        row.custom_id || ""
       ).match(
-        new RegExp(
-          "^" +
-          escapeRegExp(prefix) +
-          "-(\\d+)$"
-        )
+        pattern
       );
 
-    if (m) {
+    if (match) {
       max =
         Math.max(
           max,
-          Number(m[1])
+          Number(
+            match[1]
+          )
         );
     }
   }
 
   return (
     `${prefix}-` +
-    String(max + 1)
-      .padStart(3, "0")
+    String(
+      max + 1
+    ).padStart(
+      3,
+      "0"
+    )
   );
 }
 
-async function sendSavedMessage(
-  chatId,
-  result,
-  env
-) {
+
+// ============================================================
+// Save result UI
+// ============================================================
+
+function formatSavedText(result) {
   if (
     result.type ===
     "media_group"
   ) {
-    return sendMessage(
-      chatId,
-      `整理好了，主人。\n\n` +
-        `📦 <b>${escapeHtml(
-          result.fileName
-        )}</b>\n` +
-        `媒体数量：${result.count}\n` +
-        `📁 <code>${escapeHtml(
-          result.folderPath
-        )}</code>\n` +
-        `🆔 <code>${escapeHtml(
-          result.customId
-        )}</code>`,
-      {},
-      env
+    return (
+      `✅ <b>归档完成</b>\n\n` +
+      `📦 <b>${escapeHtml(
+        result.fileName
+      )}</b>\n` +
+      `媒体数量：${result.count}\n` +
+      `📁 <code>${escapeHtml(
+        result.folderPath
+      )}</code>\n` +
+      `🆔 <code>${escapeHtml(
+        result.customId
+      )}</code>`
     );
   }
 
   if (
-    result.type === "link"
+    result.type ===
+    "link"
   ) {
-    return sendMessage(
-      chatId,
-      `整理好了，主人。\n\n` +
-        `🔗 <b>${escapeHtml(
-          result.fileName
-        )}</b>\n` +
-        `📁 <code>${escapeHtml(
-          result.folderPath
-        )}</code>\n` +
-        `🆔 <code>${escapeHtml(
-          result.customId
-        )}</code>`,
-      {},
-      env
-    );
-  }
-
-  return sendMessage(
-    chatId,
-    `整理好了，主人。\n\n` +
-      `📄 <b>${escapeHtml(
+    return (
+      `✅ <b>归档完成</b>\n\n` +
+      `🔗 <b>${escapeHtml(
         result.fileName
       )}</b>\n` +
       `📁 <code>${escapeHtml(
@@ -2099,116 +3062,86 @@ async function sendSavedMessage(
       )}</code>\n` +
       `🆔 <code>${escapeHtml(
         result.customId
-      )}</code>`,
-    {},
-    env
+      )}</code>`
+    );
+  }
+
+  return (
+    `✅ <b>归档完成</b>\n\n` +
+    `${getResourceIcon(
+      result.mimeType
+    )} <b>${escapeHtml(
+      result.fileName
+    )}</b>\n` +
+    `📁 <code>${escapeHtml(
+      result.folderPath
+    )}</code>\n` +
+    `🆔 <code>${escapeHtml(
+      result.customId
+    )}</code>`
   );
 }
 
-async function showBatchProgress(
-  userId,
+
+function fileResultKeyboard(result) {
+  return {
+    inline_keyboard: [
+      [
+        {
+          text:
+            "📂 查看文件夹",
+          callback_data:
+            `folder:${result.folderId}:0`
+        }
+      ]
+    ]
+  };
+}
+
+
+async function sendSavedMessage(
   chatId,
   result,
   env
 ) {
-  const r =
-    await getStateRecord(
-      userId,
-      env
-    );
-
-  const n =
-    Number(
-      r?.batch_done || 0
-    ) + 1;
-
-  const frames = [
-    "▓░░░░░",
-    "▓▓░░░░",
-    "▓▓▓░░░",
-    "▓▓▓▓░░",
-    "▓▓▓▓▓░",
-    "▓▓▓▓▓▓"
-  ];
-
-  const bar =
-    frames[
-      (n - 1) %
-      frames.length
-    ];
-
-  const text =
-    `⏳ 正在连续归档\n` +
-    `${bar} 已处理 ${n} 个\n\n` +
-    `📄 ${escapeHtml(
-      result.fileName
-    )}`;
-
-  if (r?.progress_message_id) {
-    await telegram(
-      "editMessageText",
-      {
-        chat_id: chatId,
-        message_id:
-          Number(
-            r.progress_message_id
-          ),
-        text,
-        parse_mode: "HTML"
-      },
-      env
-    );
-
-    await env.DB.prepare(`
-      UPDATE user_states
-      SET batch_done = ?,
-          updated_at = CURRENT_TIMESTAMP
-      WHERE chat_id = ?
-    `).bind(
-      n,
-      userId
-    ).run();
-  } else {
-    const sent =
-      await sendMessage(
-        chatId,
-        text,
-        {},
-        env
-      );
-
-    const mid =
-      sent?.result?.message_id;
-
-    await env.DB.prepare(`
-      UPDATE user_states
-      SET progress_message_id = ?,
-          batch_done = ?,
-          updated_at = CURRENT_TIMESTAMP
-      WHERE chat_id = ?
-    `).bind(
-      mid,
-      n,
-      userId
-    ).run();
-  }
+  return sendMessage(
+    chatId,
+    formatSavedText(
+      result
+    ),
+    {
+      reply_markup:
+        fileResultKeyboard(
+          result
+        )
+    },
+    env
+  );
 }
 
-/* -------------------- Folder views -------------------- */
+
+// ============================================================
+// Folder views
+// ============================================================
 
 async function queryFolders(
   userId,
   parentId,
   env
 ) {
-  if (parentId === null) {
+  if (
+    parentId === null
+  ) {
     return (
       await env.DB.prepare(`
-        SELECT id,name,parent_id
+        SELECT
+          id,
+          name,
+          parent_id
         FROM folders
         WHERE user_id = ?
           AND parent_id IS NULL
-        ORDER BY name
+        ORDER BY name COLLATE NOCASE
       `).bind(
         userId
       ).all()
@@ -2217,11 +3150,14 @@ async function queryFolders(
 
   return (
     await env.DB.prepare(`
-      SELECT id,name,parent_id
+      SELECT
+        id,
+        name,
+        parent_id
       FROM folders
       WHERE user_id = ?
         AND parent_id = ?
-      ORDER BY name
+      ORDER BY name COLLATE NOCASE
     `).bind(
       userId,
       parentId
@@ -2229,10 +3165,13 @@ async function queryFolders(
   ).results || [];
 }
 
+
 async function showFolderRoot(
   userId,
   chatId,
-  env
+  page,
+  env,
+  editMessageId = null
 ) {
   const folders =
     await queryFolders(
@@ -2241,36 +3180,95 @@ async function showFolderRoot(
       env
     );
 
+  const total =
+    folders.length;
+
+  const totalPages =
+    Math.max(
+      1,
+      Math.ceil(
+        total /
+          PAGE_SIZE
+      )
+    );
+
+  const safePage =
+    clampPage(
+      page,
+      totalPages
+    );
+
+  const start =
+    safePage *
+    PAGE_SIZE;
+
+  const visible =
+    folders.slice(
+      start,
+      start + PAGE_SIZE
+    );
+
   const buttons =
-    folders.map(
+    visible.map(
       f => [
         {
           text:
-            `📁 ${f.name}`,
+            `📁 ${truncate(
+              f.name,
+              28
+            )}`,
           callback_data:
-            `folder:${f.id}`
+            `folder:${f.id}:0`
         }
       ]
     );
 
-  return sendMessage(
-    chatId,
-    "主人，这是文件库的根目录：",
+  const navigation =
+    paginationButtons(
+      "rootpage",
+      safePage,
+      totalPages
+    );
+
+  if (navigation.length) {
+    buttons.push(
+      navigation
+    );
+  }
+
+  buttons.push([
     {
-      reply_markup: {
-        inline_keyboard:
-          buttons
-      }
+      text:
+        "🏠 首页",
+      callback_data:
+        "home:back"
+    }
+  ]);
+
+  const text =
+    `📁 <b>文件夹</b>\n\n` +
+    `根目录共有 ${total} 个文件夹。`;
+
+  return renderMenu(
+    chatId,
+    editMessageId,
+    text,
+    {
+      inline_keyboard:
+        buttons
     },
     env
   );
 }
 
+
 async function showFolder(
   userId,
   chatId,
   folderId,
-  env
+  page,
+  env,
+  editMessageId = null
 ) {
   const folder =
     await getFolder(
@@ -2298,46 +3296,114 @@ async function showFolder(
   const files =
     (
       await env.DB.prepare(`
-        SELECT id,file_name,custom_id,mime_type
+        SELECT
+          id,
+          file_name,
+          custom_id,
+          mime_type
         FROM files
         WHERE user_id = ?
           AND folder_id = ?
-        ORDER BY created_at DESC
+        ORDER BY created_at DESC, id DESC
       `).bind(
         userId,
         folderId
       ).all()
     ).results || [];
 
-  const buttons = [];
+  const totalItems =
+    subs.length +
+    files.length;
 
-  for (const f of subs) {
-    buttons.push([
-      {
-        text:
-          `📁 ${f.name}`,
-        callback_data:
-          `folder:${f.id}`
-      }
-    ]);
-  }
+  const totalPages =
+    Math.max(
+      1,
+      Math.ceil(
+        totalItems /
+          PAGE_SIZE
+      )
+    );
 
-  for (const f of files) {
-    buttons.push([
-      {
-        text:
-          `${getResourceIcon(
-            f.mime_type
-          )} ` +
-          `${f.custom_id || "无ID"} · ` +
-          `${truncate(
-            f.file_name,
-            22
-          )}`,
-        callback_data:
-          `file:${f.id}`
+  const safePage =
+    clampPage(
+      page,
+      totalPages
+    );
+
+  const allItems = [
+    ...subs.map(
+      f => ({
+        kind: "folder",
+        data: f
+      })
+    ),
+
+    ...files.map(
+      f => ({
+        kind: "file",
+        data: f
+      })
+    )
+  ];
+
+  const visible =
+    allItems.slice(
+      safePage *
+        PAGE_SIZE,
+      safePage *
+        PAGE_SIZE +
+        PAGE_SIZE
+    );
+
+  const buttons =
+    visible.map(
+      item => {
+        if (
+          item.kind ===
+          "folder"
+        ) {
+          return [
+            {
+              text:
+                `📁 ${truncate(
+                  item.data.name,
+                  25
+                )}`,
+              callback_data:
+                `folder:${item.data.id}:0`
+            }
+          ];
+        }
+
+        return [
+          {
+            text:
+              `${getResourceIcon(
+                item.data.mime_type
+              )} ` +
+              `${item.data.custom_id || "无ID"} · ` +
+              `${truncate(
+                item.data.file_name,
+                20
+              )}`,
+            callback_data:
+              `file:${item.data.id}`
+          }
+        ];
       }
-    ]);
+    );
+
+  const navigation =
+    paginationButtons(
+      `folderpage:${folderId}`,
+      safePage,
+      totalPages
+    );
+
+  if (navigation.length) {
+    buttons.push(
+      navigation
+    );
   }
 
   if (
@@ -2345,12 +3411,31 @@ async function showFolder(
   ) {
     buttons.push([
       {
-        text: "⬆️ 上一级",
+        text:
+          "⬆️ 上一级",
         callback_data:
-          `folder:${folder.parent_id}`
+          `folder:${folder.parent_id}:0`
+      }
+    ]);
+  } else {
+    buttons.push([
+      {
+        text:
+          "📁 根目录",
+        callback_data:
+          "folderroot"
       }
     ]);
   }
+
+  buttons.push([
+    {
+      text:
+        "🏠 首页",
+      callback_data:
+        "home:back"
+    }
+  ]);
 
   const path =
     await getFolderPath(
@@ -2359,55 +3444,100 @@ async function showFolder(
       env
     );
 
-  return sendMessage(
-    chatId,
+  const text =
     `📁 <b>${escapeHtml(
       folder.name
     )}</b>\n\n` +
-      `路径：<code>${escapeHtml(
-        path
-      )}</code>\n\n` +
-      `📁 子文件夹：${subs.length}\n` +
-      `📦 资源：${files.length}`,
+    `📍 <code>${escapeHtml(
+      path
+    )}</code>\n` +
+    `📁 子文件夹：${subs.length}\n` +
+    `📦 资源：${files.length}`;
+
+  return renderMenu(
+    chatId,
+    editMessageId,
+    text,
     {
-      reply_markup: {
-        inline_keyboard:
-          buttons
-      }
+      inline_keyboard:
+        buttons
     },
     env
   );
 }
 
+
 async function showRecentFiles(
   userId,
   chatId,
-  env
+  page,
+  env,
+  editMessageId = null
 ) {
-  const files =
+  const rows =
     (
       await env.DB.prepare(`
-        SELECT id,file_name,custom_id,mime_type
+        SELECT
+          id,
+          file_name,
+          custom_id,
+          mime_type
         FROM files
         WHERE user_id = ?
-        ORDER BY created_at DESC
-        LIMIT 30
+        ORDER BY created_at DESC, id DESC
       `).bind(
         userId
       ).all()
     ).results || [];
 
-  if (!files.length) {
-    return sendMessage(
+  if (!rows.length) {
+    return renderMenu(
       chatId,
-      "主人，目前还没有资源。",
-      {},
+      editMessageId,
+      "📄 <b>最近资源</b>\n\n" +
+        "主人，目前还没有资源。",
+      {
+        inline_keyboard: [
+          [
+            {
+              text:
+                "🏠 首页",
+              callback_data:
+                "home:back"
+            }
+          ]
+        ]
+      },
       env
     );
   }
 
+  const totalPages =
+    Math.max(
+      1,
+      Math.ceil(
+        rows.length /
+          PAGE_SIZE
+      )
+    );
+
+  const safePage =
+    clampPage(
+      page,
+      totalPages
+    );
+
+  const visible =
+    rows.slice(
+      safePage *
+        PAGE_SIZE,
+      safePage *
+        PAGE_SIZE +
+        PAGE_SIZE
+    );
+
   const buttons =
-    files.map(
+    visible.map(
       f => [
         {
           text:
@@ -2417,7 +3547,7 @@ async function showRecentFiles(
             `${f.custom_id || "无ID"} · ` +
             `${truncate(
               f.file_name,
-              20
+              22
             )}`,
           callback_data:
             `file:${f.id}`
@@ -2425,34 +3555,61 @@ async function showRecentFiles(
       ]
     );
 
-  return sendMessage(
-    chatId,
-    `📄 <b>最近的资源</b>\n` +
-      `显示最近整理的 ${files.length} 个资源。`,
+  const navigation =
+    paginationButtons(
+      "recent",
+      safePage,
+      totalPages
+    );
+
+  if (navigation.length) {
+    buttons.push(
+      navigation
+    );
+  }
+
+  buttons.push([
     {
-      reply_markup: {
-        inline_keyboard:
-          buttons
-      }
+      text:
+        "🏠 首页",
+      callback_data:
+        "home:back"
+    }
+  ]);
+
+  return renderMenu(
+    chatId,
+    editMessageId,
+    `📄 <b>最近资源</b>\n\n` +
+      `共 ${rows.length} 个资源`,
+    {
+      inline_keyboard:
+        buttons
     },
     env
   );
 }
 
+
+// ============================================================
+// File detail
+// ============================================================
+
 async function showFile(
   userId,
   chatId,
   id,
-  env
+  env,
+  editMessageId = null
 ) {
-  const f =
+  const file =
     await getFile(
       userId,
       id,
       env
     );
 
-  if (!f) {
+  if (!file) {
     return sendMessage(
       chatId,
       "这个资源已经不存在了。",
@@ -2464,23 +3621,19 @@ async function showFile(
   return renderFile(
     userId,
     chatId,
-    f,
-    env
+    file,
+    env,
+    editMessageId
   );
 }
 
-/*
- * 文件详情页。
- *
- * 注意：
- * 这里故意不再放「上一个 / 下一个」。
- * 导航按钮会在实际取出的资源下面显示。
- */
+
 async function renderFile(
   userId,
   chatId,
   f,
-  env
+  env,
+  editMessageId = null
 ) {
   const path =
     f.folder_id
@@ -2498,166 +3651,144 @@ async function renderFile(
         )
       : "未知";
 
-  const buttons = [];
+  const buttons = [
+    [
+      {
+        text:
+          "📤 取出资源",
+        callback_data:
+          `sendfile:${f.id}`
+      }
+    ],
+    [
+      {
+        text:
+          "🆔 修改 ID",
+        callback_data:
+          `customid:${f.id}`
+      },
+      {
+        text:
+          "📂 移动",
+        callback_data:
+          `move_start:${f.id}`
+      }
+    ],
+    [
+      {
+        text:
+          "🗑 删除",
+        callback_data:
+          `deletefile:${f.id}`
+      }
+    ]
+  ];
 
-  buttons.push([
-    {
-      text: "📤 取出资源",
-      callback_data:
-        `sendfile:${f.id}`
-    }
-  ]);
-
-  buttons.push([
-    {
-      text: "🆔 修改 ID",
-      callback_data:
-        `customid:${f.id}`
-    }
-  ]);
-
-  buttons.push([
-    {
-      text: "🗑 删除索引",
-      callback_data:
-        `deletefile:${f.id}`
-    }
-  ]);
-
-  buttons.push([
-    {
-      text: "📂 移动到...",
-      callback_data:
-        `move_start:${f.id}`
-    }
-  ]);
-
-  if (f.folder_id) {
+  if (
+    f.folder_id
+  ) {
     buttons.push([
       {
-        text: "⬆️ 返回文件夹",
+        text:
+          "⬅️ 返回文件夹",
         callback_data:
-          `folder:${f.folder_id}`
+          `folder:${f.folder_id}:0`
+      }
+    ]);
+  } else {
+    buttons.push([
+      {
+        text:
+          "📁 文件夹",
+        callback_data:
+          "folderroot"
       }
     ]);
   }
 
-  return sendMessage(
-    chatId,
+  buttons.push([
+    {
+      text:
+        "🏠 首页",
+      callback_data:
+        "home:back"
+    }
+  ]);
+
+  const text =
     `${getResourceIcon(
       f.mime_type
-    )} ` +
-      `<b>${escapeHtml(
-        f.file_name
-      )}</b>\n\n` +
-      `🆔 ID：<code>${escapeHtml(
-        f.custom_id || "无"
-      )}</code>\n` +
-      `📁 路径：<code>${escapeHtml(
-        path
-      )}</code>\n` +
-      `📦 大小：${size}\n` +
-      `🗂 类型：${escapeHtml(
-        f.mime_type || "未知"
-      )}`,
+    )} <b>${escapeHtml(
+      f.file_name
+    )}</b>\n\n` +
+
+    `🆔 ID：<code>${escapeHtml(
+      f.custom_id || "无"
+    )}</code>\n` +
+
+    `📁 路径：<code>${escapeHtml(
+      path
+    )}</code>\n` +
+
+    `📦 大小：${size}\n` +
+
+    `🗂 类型：<code>${escapeHtml(
+      f.mime_type ||
+      "未知"
+    )}</code>`;
+
+  return renderMenu(
+    chatId,
+    editMessageId,
+    text,
     {
-      reply_markup: {
-        inline_keyboard:
-          buttons
-      }
+      inline_keyboard:
+        buttons
     },
     env
   );
 }
 
-/*
- * 实际取出资源后的导航按钮。
- *
- * 这里根据当前 custom_id 找前后两个文件。
- *
- * 如果没有上一项/下一项，则使用 noop，
- * 这样按钮仍保持在原位置。
- */
-function buildFileNavigationButtons(
-  prev,
-  next
-) {
-  if (!prev && !next) {
-    return null;
-  }
 
-  return {
-    inline_keyboard: [
-      [
-        {
-          text: "⬅️ 上一个",
-          callback_data:
-            prev
-              ? `prevfile:${encodeURIComponent(
-                  prev.custom_id
-                )}`
-              : "noop"
-        },
-        {
-          text: "➡️ 下一个",
-          callback_data:
-            next
-              ? `nextfile:${encodeURIComponent(
-                  next.custom_id
-                )}`
-              : "noop"
-        }
-      ]
-    ]
-  };
-}
+// ============================================================
+// Navigation
+// ============================================================
 
-/*
- * 点击「上一个 / 下一个」以后，
- * 不再打开文件详情页。
- *
- * 而是直接把相邻资源取出来。
- */
 async function navigateFile(
   userId,
   chatId,
-  customId,
-  dir,
+  currentId,
+  direction,
   env
 ) {
-  const cur =
-    await env.DB.prepare(`
-      SELECT id,custom_id
-      FROM files
-      WHERE user_id = ?
-        AND custom_id = ?
-      LIMIT 1
-    `).bind(
+  const current =
+    await getFile(
       userId,
-      customId
-    ).first();
+      currentId,
+      env
+    );
 
-  if (!cur) {
+  if (!current) {
     return sendMessage(
       chatId,
-      "这个 ID 已不存在。",
+      "这个资源已经不存在了。",
       {},
       env
     );
   }
 
-  const n =
+  const adjacent =
     await adjacentFile(
       userId,
-      customId,
-      dir,
+      current.custom_id,
+      direction,
       env
     );
 
-  if (!n) {
+  if (!adjacent) {
     return sendMessage(
       chatId,
-      dir < 0
+      direction < 0
         ? "已经是第一项了。"
         : "已经是最后一项了。",
       {},
@@ -2665,40 +3796,43 @@ async function navigateFile(
     );
   }
 
-  /*
-   * 关键修改：
-   *
-   * 原来这里是 renderFile()，
-   * 现在直接 resendFile()。
-   */
   return resendFile(
     userId,
     chatId,
-    n.id,
+    adjacent.id,
     env
   );
 }
 
+
 async function adjacentFile(
   userId,
   customId,
-  dir,
+  direction,
   env
 ) {
-  const op =
-    dir < 0 ? "<" : ">";
+  if (!customId) {
+    return null;
+  }
+
+  const operator =
+    direction < 0
+      ? "<"
+      : ">";
 
   const order =
-    dir < 0
+    direction < 0
       ? "DESC"
       : "ASC";
 
   return env.DB.prepare(`
-    SELECT id,custom_id
+    SELECT
+      id,
+      custom_id
     FROM files
     WHERE user_id = ?
-      AND custom_id ${op} ?
-    ORDER BY custom_id ${order}
+      AND custom_id ${operator} ?
+    ORDER BY custom_id ${order}, id ${order}
     LIMIT 1
   `).bind(
     userId,
@@ -2706,88 +3840,11 @@ async function adjacentFile(
   ).first();
 }
 
-async function getFile(
-  userId,
-  id,
-  env
-) {
-  return env.DB.prepare(`
-    SELECT *
-    FROM files
-    WHERE user_id = ?
-      AND id = ?
-    LIMIT 1
-  `).bind(
-    userId,
-    id
-  ).first();
-}
 
-async function getFolder(
-  userId,
-  id,
-  env
-) {
-  return env.DB.prepare(`
-    SELECT id,name,parent_id,created_at
-    FROM folders
-    WHERE user_id = ?
-      AND id = ?
-    LIMIT 1
-  `).bind(
-    userId,
-    id
-  ).first();
-}
+// ============================================================
+// Resend
+// ============================================================
 
-async function getFolderPath(
-  userId,
-  id,
-  env
-) {
-  const p = [];
-
-  let cur = id;
-
-  for (
-    let i = 0;
-    cur != null && i < 100;
-    i++
-  ) {
-    const f =
-      await getFolder(
-        userId,
-        cur,
-        env
-      );
-
-    if (!f) break;
-
-    p.unshift(f.name);
-
-    cur =
-      f.parent_id;
-  }
-
-  return p.join("/");
-}
-
-/* -------------------- Resend -------------------- */
-
-/*
- * 取出文件。
- *
- * 普通文件：
- * 直接把 Inline Keyboard 放在实际文件消息下面。
- *
- * 媒体组：
- * Telegram sendMediaGroup 不支持 reply_markup，
- * 所以由 resendMediaGroup 在媒体组发送完成后，
- * 紧接着发送导航按钮。
- *
- * 链接：
- * 直接把按钮放在链接消息下面。
- */
 async function resendFile(
   userId,
   chatId,
@@ -2834,12 +3891,6 @@ async function resendFile(
     );
   }
 
-  /*
-   * 计算当前文件的前后文件。
-   *
-   * 注意这里使用 custom_id 排序，
-   * 与原来的 adjacentFile() 保持一致。
-   */
   const prev =
     await adjacentFile(
       userId,
@@ -2858,29 +3909,46 @@ async function resendFile(
 
   const replyMarkup =
     buildFileNavigationButtons(
+      f.id,
       prev,
       next
     );
+
+  const caption =
+    `🆔 ${f.custom_id || ""}\n` +
+    `📄 ${f.file_name}`;
 
   let method =
     "sendDocument";
 
   let body = {
-    chat_id: chatId,
-    document: f.file_id,
-    caption:
-      `🆔 ${
-        f.custom_id || ""
-      }\n` +
-      `📄 ${f.file_name}`
+    chat_id:
+      chatId,
+
+    document:
+      f.file_id,
+
+    caption
   };
 
-  if (replyMarkup) {
-    body.reply_markup =
-      replyMarkup;
-  }
-
   if (
+    f.mime_type?.startsWith(
+      "image/"
+    )
+  ) {
+    method =
+      "sendPhoto";
+
+    body = {
+      chat_id:
+        chatId,
+
+      photo:
+        f.file_id,
+
+      caption
+    };
+  } else if (
     f.mime_type?.startsWith(
       "video/"
     )
@@ -2889,19 +3957,14 @@ async function resendFile(
       "sendVideo";
 
     body = {
-      chat_id: chatId,
-      video: f.file_id,
-      caption:
-        `🆔 ${
-          f.custom_id || ""
-        }\n` +
-        `📄 ${f.file_name}`
-    };
+      chat_id:
+        chatId,
 
-    if (replyMarkup) {
-      body.reply_markup =
-        replyMarkup;
-    }
+      video:
+        f.file_id,
+
+      caption
+    };
   } else if (
     f.mime_type?.startsWith(
       "audio/"
@@ -2911,41 +3974,35 @@ async function resendFile(
       "sendAudio";
 
     body = {
-      chat_id: chatId,
-      audio: f.file_id,
-      caption:
-        `🆔 ${
-          f.custom_id || ""
-        }\n` +
-        `📄 ${f.file_name}`
-    };
+      chat_id:
+        chatId,
 
-    if (replyMarkup) {
-      body.reply_markup =
-        replyMarkup;
-    }
+      audio:
+        f.file_id,
+
+      caption
+    };
   } else if (
-    f.mime_type?.startsWith(
-      "image/"
-    )
+    f.mime_type ===
+    "audio/ogg"
   ) {
     method =
-      "sendPhoto";
+      "sendVoice";
 
     body = {
-      chat_id: chatId,
-      photo: f.file_id,
-      caption:
-        `🆔 ${
-          f.custom_id || ""
-        }\n` +
-        `📄 ${f.file_name}`
-    };
+      chat_id:
+        chatId,
 
-    if (replyMarkup) {
-      body.reply_markup =
-        replyMarkup;
-    }
+      voice:
+        f.file_id,
+
+      caption
+    };
+  }
+
+  if (replyMarkup) {
+    body.reply_markup =
+      replyMarkup;
   }
 
   return telegram(
@@ -2954,6 +4011,41 @@ async function resendFile(
     env
   );
 }
+
+
+function buildFileNavigationButtons(
+  currentId,
+  prev,
+  next
+) {
+  if (!prev && !next) {
+    return null;
+  }
+
+  return {
+    inline_keyboard: [
+      [
+        {
+          text:
+            "⬅️ 上一个",
+          callback_data:
+            prev
+              ? `prevfile:${currentId}`
+              : "noop"
+        },
+        {
+          text:
+            "➡️ 下一个",
+          callback_data:
+            next
+              ? `nextfile:${currentId}`
+              : "noop"
+        }
+      ]
+    ]
+  };
+}
+
 
 async function resendMediaGroup(
   userId,
@@ -2979,26 +4071,47 @@ async function resendMediaGroup(
 
   const media =
     (data.items || [])
-      .map(x => {
-        const type =
-          x.kind === "photo"
-            ? "photo"
-            : x.kind === "video"
-              ? "video"
-              : "document";
+      .map(
+        x => {
+          let type =
+            "document";
 
-        const item = {
-          type,
-          media: x.fileId
-        };
+          if (
+            x.kind ===
+            "photo"
+          ) {
+            type =
+              "photo";
+          } else if (
+            x.kind ===
+              "video" ||
+            x.kind ===
+              "animation"
+          ) {
+            type =
+              "video";
+          } else if (
+            x.kind ===
+              "audio"
+          ) {
+            type =
+              "audio";
+          }
 
-        if (x.caption) {
-          item.caption =
-            x.caption;
+          const item = {
+            type,
+            media:
+              x.fileId
+          };
+
+          if (x.caption) {
+            item.caption =
+              x.caption;
+          }
+
+          return item;
         }
-
-        return item;
-      });
+      );
 
   if (!media.length) {
     return sendMessage(
@@ -3009,32 +4122,22 @@ async function resendMediaGroup(
     );
   }
 
-  /*
-   * Telegram Bot API 的 sendMediaGroup
-   * 不能直接设置 reply_markup。
-   *
-   * 所以先完整发送媒体组。
-   */
   const result =
     await telegram(
       "sendMediaGroup",
       {
-        chat_id: chatId,
+        chat_id:
+          chatId,
+
         media
       },
       env
     );
 
-  /*
-   * 如果发送失败，就不继续发送导航按钮。
-   */
   if (!result?.ok) {
     return result;
   }
 
-  /*
-   * 找到媒体组前后相邻资源。
-   */
   const prev =
     await adjacentFile(
       userId,
@@ -3053,21 +4156,11 @@ async function resendMediaGroup(
 
   const replyMarkup =
     buildFileNavigationButtons(
+      f.id,
       prev,
       next
     );
 
-  /*
-   * 如果存在上一项或下一项，
-   * 紧接着媒体组发送一个导航消息。
-   *
-   * 这样视觉上就是：
-   *
-   * 图片
-   * 图片
-   * 图片
-   * ⬅️ 上一个    ➡️ 下一个
-   */
   if (replyMarkup) {
     await sendMessage(
       chatId,
@@ -3088,16 +4181,13 @@ async function resendMediaGroup(
   return result;
 }
 
+
 async function resendLink(
   userId,
   chatId,
   f,
   env
 ) {
-  /*
-   * 链接也需要找到前后文件，
-   * 然后把按钮直接放在链接消息下面。
-   */
   const prev =
     await adjacentFile(
       userId,
@@ -3116,48 +4206,323 @@ async function resendLink(
 
   const replyMarkup =
     buildFileNavigationButtons(
+      f.id,
       prev,
       next
     );
 
+  let x;
+
   try {
-    const x =
+    x =
       JSON.parse(
         f.file_id
       );
-
-    return sendMessage(
-      chatId,
-      x.text ||
-        x.url,
-      {
-        disable_web_page_preview:
-          false,
-        ...(replyMarkup
-          ? {
-              reply_markup:
-                replyMarkup
-            }
-          : {})
-      },
-      env
-    );
   } catch {
-    return sendMessage(
-      chatId,
+    x = {
+      text:
+        f.file_name,
+      url:
+        ""
+    };
+  }
+
+  return sendMessage(
+    chatId,
+    x.text ||
+      x.url ||
       f.file_name,
-      replyMarkup
+    {
+      disable_web_page_preview:
+        false,
+
+      ...(replyMarkup
         ? {
             reply_markup:
               replyMarkup
           }
-        : {},
+        : {})
+    },
+    env
+  );
+}
+
+
+// ============================================================
+// Move
+// ============================================================
+
+async function startMove(
+  userId,
+  chatId,
+  fileId,
+  env
+) {
+  const file =
+    await getFile(
+      userId,
+      fileId,
+      env
+    );
+
+  if (!file) {
+    return sendMessage(
+      chatId,
+      "这个资源不存在。",
+      {},
       env
     );
   }
+
+  await setState(
+    userId,
+    `moving:${fileId}`,
+    env
+  );
+
+  return showMoveFolders(
+    userId,
+    chatId,
+    null,
+    null,
+    env
+  );
 }
 
-/* -------------------- Inline mode -------------------- */
+
+async function showMoveFolders(
+  userId,
+  chatId,
+  parentId,
+  editMessageId,
+  env
+) {
+  const folders =
+    await queryFolders(
+      userId,
+      parentId,
+      env
+    );
+
+  const buttons = [];
+
+  for (const f of folders) {
+    buttons.push([
+      {
+        text:
+          `📥 ${truncate(
+            f.name,
+            25
+          )}`,
+        callback_data:
+          `move_here:${f.id}`
+      },
+      {
+        text:
+          "📂",
+        callback_data:
+          `move_browse:${f.id}`
+      }
+    ]);
+  }
+
+  if (
+    parentId !== null
+  ) {
+    const f =
+      await getFolder(
+        userId,
+        parentId,
+        env
+      );
+
+    buttons.push([
+      {
+        text:
+          "📥 移到这里",
+        callback_data:
+          `move_here:${parentId}`
+      }
+    ]);
+
+    if (
+      f?.parent_id !== null
+    ) {
+      buttons.push([
+        {
+          text:
+            "⬆️ 上一级",
+          callback_data:
+            `move_browse:${f.parent_id}`
+        }
+      ]);
+    }
+  }
+
+  buttons.push([
+    {
+      text:
+        "🏠 根目录",
+      callback_data:
+        "move_browse:root"
+    },
+    {
+      text:
+        "取消",
+      callback_data:
+        "move_cancel"
+    }
+  ]);
+
+  const text =
+    parentId === null
+      ? "📂 <b>选择目标文件夹</b>"
+      : `📂 <b>移动到</b>\n\n` +
+        `当前：<code>${escapeHtml(
+          await getFolderPath(
+            userId,
+            parentId,
+            env
+          )
+        )}</code>`;
+
+  return renderMenu(
+    chatId,
+    editMessageId,
+    text,
+    {
+      inline_keyboard:
+        buttons
+    },
+    env
+  );
+}
+
+
+async function moveHere(
+  userId,
+  chatId,
+  target,
+  env
+) {
+  const state =
+    await getState(
+      userId,
+      env
+    );
+
+  if (
+    !state?.startsWith(
+      "moving:"
+    )
+  ) {
+    return sendMessage(
+      chatId,
+      "移动操作已经失效，请重新选择。",
+      {},
+      env
+    );
+  }
+
+  const fileId =
+    Number(
+      state.slice(
+        "moving:".length
+      )
+    );
+
+  const folderId =
+    target === "root"
+      ? null
+      : Number(target);
+
+  if (
+    folderId !== null
+  ) {
+    const folder =
+      await getFolder(
+        userId,
+        folderId,
+        env
+      );
+
+    if (!folder) {
+      return sendMessage(
+        chatId,
+        "这个文件夹已经不存在了。",
+        {},
+        env
+      );
+    }
+  }
+
+  const result =
+    await env.DB.prepare(`
+      UPDATE files
+      SET folder_id = ?
+      WHERE id = ?
+        AND user_id = ?
+    `).bind(
+      folderId,
+      fileId,
+      userId
+    ).run();
+
+  if (
+    Number(
+      result.meta?.changes || 0
+    ) !== 1
+  ) {
+    return sendMessage(
+      chatId,
+      "移动失败，这个资源可能已经不存在了。",
+      {},
+      env
+    );
+  }
+
+  await clearState(
+    userId,
+    env
+  );
+
+  const file =
+    await getFile(
+      userId,
+      fileId,
+      env
+    );
+
+  const path =
+    folderId === null
+      ? "根目录"
+      : await getFolderPath(
+          userId,
+          folderId,
+          env
+        );
+
+  return sendMessage(
+    chatId,
+    `✅ <b>移动完成</b>\n\n` +
+      `${getResourceIcon(
+        file?.mime_type
+      )} ${escapeHtml(
+        file?.file_name ||
+        "资源"
+      )}\n` +
+      `📁 <code>${escapeHtml(
+        path
+      )}</code>`,
+    {},
+    env
+  );
+}
+
+
+// ============================================================
+// Inline mode
+// ============================================================
 
 async function handleInlineQuery(
   q,
@@ -3166,23 +4531,30 @@ async function handleInlineQuery(
   const userId =
     String(q.from.id);
 
-  if (userId !== OWNER_ID) {
+  if (
+    userId !== OWNER_ID
+  ) {
     return telegram(
       "answerInlineQuery",
       {
         inline_query_id:
           q.id,
+
         results: [],
+
         cache_time: 0,
-        is_personal: true
+
+        is_personal:
+          true
       },
       env
     );
   }
 
   const term =
-    String(q.query || "")
-      .trim();
+    String(
+      q.query || ""
+    ).trim();
 
   const pattern =
     `%${term}%`;
@@ -3216,33 +4588,34 @@ async function handleInlineQuery(
       ).all()
     ).results || [];
 
-  const results =
-    rows.map(
-      f =>
-        inlineResult(f)
-    );
-
   return telegram(
     "answerInlineQuery",
     {
       inline_query_id:
         q.id,
-      results,
-      cache_time: 0,
-      is_personal: true
+
+      results:
+        rows.map(
+          inlineResult
+        ),
+
+      cache_time:
+        0,
+
+      is_personal:
+        true
     },
     env
   );
 }
+
 
 function inlineResult(f) {
   const title =
     `${f.custom_id || "无ID"} · ${f.file_name}`;
 
   const caption =
-    `🆔 ${
-      f.custom_id || ""
-    }\n` +
+    `🆔 ${f.custom_id || ""}\n` +
     `📄 ${f.file_name}`;
 
   if (
@@ -3251,11 +4624,17 @@ function inlineResult(f) {
     )
   ) {
     return {
-      type: "photo",
-      id: String(f.id),
+      type:
+        "photo",
+
+      id:
+        String(f.id),
+
       photo_file_id:
         f.file_id,
+
       title,
+
       caption
     };
   }
@@ -3266,13 +4645,20 @@ function inlineResult(f) {
     )
   ) {
     return {
-      type: "video",
-      id: String(f.id),
+      type:
+        "video",
+
+      id:
+        String(f.id),
+
       video_file_id:
         f.file_id,
+
       title,
+
       mime_type:
         f.mime_type,
+
       caption
     };
   }
@@ -3283,11 +4669,17 @@ function inlineResult(f) {
     )
   ) {
     return {
-      type: "audio",
-      id: String(f.id),
+      type:
+        "audio",
+
+      id:
+        String(f.id),
+
       audio_file_id:
         f.file_id,
+
       title,
+
       caption
     };
   }
@@ -3299,11 +4691,17 @@ function inlineResult(f) {
       "text/link"
   ) {
     return {
-      type: "document",
-      id: String(f.id),
+      type:
+        "document",
+
+      id:
+        String(f.id),
+
       document_file_id:
         f.file_id,
+
       title,
+
       caption
     };
   }
@@ -3322,46 +4720,263 @@ function inlineResult(f) {
     } catch {}
 
     return {
-      type: "article",
-      id: String(f.id),
+      type:
+        "article",
+
+      id:
+        String(f.id),
+
       title,
+
       description:
         x.url ||
         f.file_name,
+
       input_message_content: {
         message_text:
-          escapeHtml(
-            x.text ||
-            x.url ||
-            f.file_name
-          ),
-        parse_mode:
-          "HTML"
+          x.text ||
+          x.url ||
+          f.file_name
       }
     };
   }
 
   return {
-    type: "article",
-    id: String(f.id),
+    type:
+      "article",
+
+    id:
+      String(f.id),
+
     title,
+
     description:
       "媒体组",
+
     input_message_content: {
       message_text:
-        `📦 ${escapeHtml(
-          f.file_name
-        )}\n` +
-        `🆔 ${escapeHtml(
-          f.custom_id || ""
-        )}`,
-      parse_mode:
-        "HTML"
+        `📦 ${f.file_name}\n` +
+        `🆔 ${f.custom_id || ""}`
     }
   };
 }
 
-/* -------------------- Natural language / state -------------------- */
+
+// ============================================================
+// Search
+// ============================================================
+
+async function searchFiles(
+  userId,
+  chatId,
+  keyword,
+  page,
+  env,
+  editMessageId = null
+) {
+  const clean =
+    String(
+      keyword || ""
+    ).trim();
+
+  const pattern =
+    `%${clean}%`;
+
+  const files =
+    (
+      await env.DB.prepare(`
+        SELECT
+          id,
+          file_name,
+          custom_id,
+          mime_type
+        FROM files
+        WHERE user_id = ?
+          AND (
+            file_name LIKE ?
+            OR custom_id LIKE ?
+          )
+        ORDER BY created_at DESC
+        LIMIT 100
+      `).bind(
+        userId,
+        pattern,
+        pattern
+      ).all()
+    ).results || [];
+
+  const folders =
+    (
+      await env.DB.prepare(`
+        SELECT
+          id,
+          name
+        FROM folders
+        WHERE user_id = ?
+          AND name LIKE ?
+        ORDER BY name COLLATE NOCASE
+        LIMIT 50
+      `).bind(
+        userId,
+        pattern
+      ).all()
+    ).results || [];
+
+  const all = [
+    ...folders.map(
+      f => ({
+        kind:
+          "folder",
+        data:
+          f
+      })
+    ),
+
+    ...files.map(
+      f => ({
+        kind:
+          "file",
+        data:
+          f
+      })
+    )
+  ];
+
+  const totalPages =
+    Math.max(
+      1,
+      Math.ceil(
+        all.length /
+          SEARCH_PAGE_SIZE
+      )
+    );
+
+  const safePage =
+    clampPage(
+      page,
+      totalPages
+    );
+
+  const visible =
+    all.slice(
+      safePage *
+        SEARCH_PAGE_SIZE,
+      safePage *
+        SEARCH_PAGE_SIZE +
+        SEARCH_PAGE_SIZE
+    );
+
+  const buttons =
+    visible.map(
+      item => {
+        if (
+          item.kind ===
+          "folder"
+        ) {
+          return [
+            {
+              text:
+                `📁 ${truncate(
+                  item.data.name,
+                  28
+                )}`,
+              callback_data:
+                `folder:${item.data.id}:0`
+            }
+          ];
+        }
+
+        return [
+          {
+            text:
+              `${getResourceIcon(
+                item.data.mime_type
+              )} ` +
+              `${item.data.custom_id || "无ID"} · ` +
+              `${truncate(
+                item.data.file_name,
+                20
+              )}`,
+            callback_data:
+              `file:${item.data.id}`
+          }
+        ];
+      }
+    );
+
+  if (
+    totalPages > 1
+  ) {
+    buttons.push([
+      {
+        text:
+          safePage > 0
+            ? "⬅️"
+            : "·",
+
+        callback_data:
+          safePage > 0
+            ? `search:${encodeURIComponent(
+                clean
+              )}|${safePage - 1}`
+            : "noop"
+      },
+
+      {
+        text:
+          `${safePage + 1}/${totalPages}`,
+
+        callback_data:
+          "noop"
+      },
+
+      {
+        text:
+          safePage <
+          totalPages - 1
+            ? "➡️"
+            : "·",
+
+        callback_data:
+          safePage <
+          totalPages - 1
+            ? `search:${encodeURIComponent(
+                clean
+              )}|${safePage + 1}`
+            : "noop"
+      }
+    ]);
+  }
+
+  buttons.push([
+    {
+      text:
+        "🏠 首页",
+      callback_data:
+        "home:back"
+    }
+  ]);
+
+  return renderMenu(
+    chatId,
+    editMessageId,
+    `🔎 <b>搜索结果</b>\n\n` +
+      `关键词：<code>${escapeHtml(
+        clean
+      )}</code>\n` +
+      `找到 ${all.length} 个结果`,
+    {
+      inline_keyboard:
+        buttons
+    },
+    env
+  );
+}
+
+
+// ============================================================
+// State
+// ============================================================
 
 async function handleState(
   m,
@@ -3375,7 +4990,9 @@ async function handleState(
     );
 
   const chatId =
-    String(m.chat.id);
+    String(
+      m.chat.id
+    );
 
   const text =
     String(
@@ -3390,7 +5007,9 @@ async function handleState(
     const parent =
       state.includes(":")
         ? Number(
-            state.slice(14)
+            state.slice(
+              "create_folder:".length
+            )
           )
         : null;
 
@@ -3399,7 +5018,7 @@ async function handleState(
       env
     );
 
-    const r =
+    const result =
       await createFolderFromPath(
         userId,
         text,
@@ -3409,7 +5028,7 @@ async function handleState(
 
     await sendMessage(
       chatId,
-      r.message,
+      result.message,
       {},
       env
     );
@@ -3417,7 +5036,9 @@ async function handleState(
     return true;
   }
 
-  if (state === "search") {
+  if (
+    state === "search"
+  ) {
     await clearState(
       userId,
       env
@@ -3427,6 +5048,7 @@ async function handleState(
       userId,
       chatId,
       text,
+      0,
       env
     );
 
@@ -3440,7 +5062,9 @@ async function handleState(
   ) {
     const id =
       Number(
-        state.slice(12)
+        state.slice(
+          "rename_file:".length
+        )
       );
 
     await clearState(
@@ -3448,9 +5072,11 @@ async function handleState(
       env
     );
 
-    if (!text) return true;
+    if (!text) {
+      return true;
+    }
 
-    const dup =
+    const exists =
       await env.DB.prepare(`
         SELECT id
         FROM files
@@ -3464,7 +5090,7 @@ async function handleState(
         id
       ).first();
 
-    if (dup) {
+    if (exists) {
       return sendMessage(
         chatId,
         "这个 ID 已经被使用了。",
@@ -3486,7 +5112,7 @@ async function handleState(
 
     return sendMessage(
       chatId,
-      `新的文件 ID：<code>${escapeHtml(
+      `✅ 新的文件 ID：<code>${escapeHtml(
         text
       )}</code>`,
       {},
@@ -3496,6 +5122,11 @@ async function handleState(
 
   return false;
 }
+
+
+// ============================================================
+// Natural language
+// ============================================================
 
 async function parseNaturalLanguage(
   text,
@@ -3509,7 +5140,7 @@ async function parseNaturalLanguage(
     );
 
   if (m) {
-    const r =
+    const result =
       await createFolderFromPath(
         userId,
         cleanNaturalPath(
@@ -3520,7 +5151,7 @@ async function parseNaturalLanguage(
 
     await sendMessage(
       chatId,
-      r.message,
+      result.message,
       {},
       env
     );
@@ -3534,7 +5165,7 @@ async function parseNaturalLanguage(
     );
 
   if (m) {
-    const f =
+    const folder =
       await findFolderByPath(
         userId,
         cleanNaturalPath(
@@ -3543,23 +5174,24 @@ async function parseNaturalLanguage(
         env
       );
 
-    if (f) {
-      await showFolder(
-        userId,
-        chatId,
-        f.id,
-        env
-      );
-    } else {
+    if (!folder) {
       await sendMessage(
         chatId,
         "没有找到这个文件夹。",
         {},
         env
       );
+
+      return true;
     }
 
-    return true;
+    return showFolder(
+      userId,
+      chatId,
+      folder.id,
+      0,
+      env
+    );
   }
 
   m =
@@ -3568,14 +5200,13 @@ async function parseNaturalLanguage(
     );
 
   if (m) {
-    await searchFiles(
+    return searchFiles(
       userId,
       chatId,
       m[1],
+      0,
       env
     );
-
-    return true;
   }
 
   m =
@@ -3584,7 +5215,7 @@ async function parseNaturalLanguage(
     );
 
   if (m) {
-    const f =
+    const folder =
       await findFolderByPath(
         userId,
         cleanNaturalPath(
@@ -3593,13 +5224,15 @@ async function parseNaturalLanguage(
         env
       );
 
-    if (!f) {
-      return sendMessage(
+    if (!folder) {
+      await sendMessage(
         chatId,
         "没有找到这个文件夹。",
         {},
         env
       );
+
+      return true;
     }
 
     const pending =
@@ -3613,21 +5246,28 @@ async function parseNaturalLanguage(
         "pending_resource:"
       )
     ) {
-      const r =
+      const resource =
         parsePendingResource(
           pending
         );
 
       if (
-        !await claimPending(
+        !resource
+      ) {
+        return true;
+      }
+
+      const claimed =
+        await claimPending(
           userId,
           pending,
           env
-        )
-      ) {
+        );
+
+      if (!claimed) {
         return sendMessage(
           chatId,
-          "这个待处理资源正在被另一条消息处理，请稍后再试。",
+          "这个待处理资源正在被另一条操作处理。",
           {},
           env
         );
@@ -3636,8 +5276,8 @@ async function parseNaturalLanguage(
       return finishSave(
         userId,
         chatId,
-        r,
-        f.id,
+        resource,
+        folder.id,
         env
       );
     }
@@ -3647,7 +5287,7 @@ async function parseNaturalLanguage(
         SELECT *
         FROM files
         WHERE user_id = ?
-        ORDER BY created_at DESC
+        ORDER BY created_at DESC, id DESC
         LIMIT 1
       `).bind(
         userId
@@ -3656,7 +5296,7 @@ async function parseNaturalLanguage(
     if (!latest) {
       await setState(
         userId,
-        `move_to:${f.id}`,
+        `move_to:${folder.id}`,
         env
       );
 
@@ -3674,20 +5314,21 @@ async function parseNaturalLanguage(
       WHERE user_id = ?
         AND id = ?
     `).bind(
-      f.id,
+      folder.id,
       userId,
       latest.id
     ).run();
 
     return sendMessage(
       chatId,
-      `已移动：<b>${escapeHtml(
-        latest.file_name
-      )}</b>\n` +
+      `✅ 已移动\n\n` +
+        `📄 <b>${escapeHtml(
+          latest.file_name
+        )}</b>\n` +
         `📁 <code>${escapeHtml(
           await getFolderPath(
             userId,
-            f.id,
+            folder.id,
             env
           )
         )}</code>`,
@@ -3702,7 +5343,7 @@ async function parseNaturalLanguage(
     );
 
   if (m) {
-    const f =
+    const folder =
       await findFolderByPath(
         userId,
         cleanNaturalPath(
@@ -3711,7 +5352,7 @@ async function parseNaturalLanguage(
         env
       );
 
-    if (!f) {
+    if (!folder) {
       return sendMessage(
         chatId,
         "没有找到这个文件夹。",
@@ -3727,33 +5368,33 @@ async function parseNaturalLanguage(
         .split("/")
         .pop();
 
-    const dup =
+    const duplicate =
       await env.DB.prepare(`
         SELECT id
         FROM folders
         WHERE user_id = ?
           AND name = ?
           AND (
-            (parent_id = ?)
-            OR
-            (
+            parent_id = ?
+            OR (
               parent_id IS NULL
               AND ? IS NULL
             )
           )
           AND id != ?
+        LIMIT 1
       `).bind(
         userId,
         name,
-        f.parent_id,
-        f.parent_id,
-        f.id
+        folder.parent_id,
+        folder.parent_id,
+        folder.id
       ).first();
 
-    if (dup) {
+    if (duplicate) {
       return sendMessage(
         chatId,
-        "同一级目录已有这个文件夹。",
+        "同一级目录已经有这个文件夹了。",
         {},
         env
       );
@@ -3767,12 +5408,12 @@ async function parseNaturalLanguage(
     `).bind(
       name,
       userId,
-      f.id
+      folder.id
     ).run();
 
     return sendMessage(
       chatId,
-      `已改名为：<b>${escapeHtml(
+      `✅ 已改名为：<b>${escapeHtml(
         name
       )}</b>`,
       {},
@@ -3786,7 +5427,7 @@ async function parseNaturalLanguage(
     );
 
   if (m) {
-    const f =
+    const folder =
       await findFolderByPath(
         userId,
         cleanNaturalPath(
@@ -3795,7 +5436,7 @@ async function parseNaturalLanguage(
         env
       );
 
-    if (!f) {
+    if (!folder) {
       return sendMessage(
         chatId,
         "没有找到这个文件夹。",
@@ -3813,7 +5454,7 @@ async function parseNaturalLanguage(
         LIMIT 1
       `).bind(
         userId,
-        f.id
+        folder.id
       ).first();
 
     const file =
@@ -3825,10 +5466,13 @@ async function parseNaturalLanguage(
         LIMIT 1
       `).bind(
         userId,
-        f.id
+        folder.id
       ).first();
 
-    if (child || file) {
+    if (
+      child ||
+      file
+    ) {
       return sendMessage(
         chatId,
         "这个文件夹里面还有内容，请先清空。",
@@ -3843,12 +5487,12 @@ async function parseNaturalLanguage(
         AND id = ?
     `).bind(
       userId,
-      f.id
+      folder.id
     ).run();
 
     return sendMessage(
       chatId,
-      `已删除：<code>${escapeHtml(
+      `🗑 已删除：<code>${escapeHtml(
         cleanNaturalPath(
           m[1]
         )
@@ -3860,6 +5504,11 @@ async function parseNaturalLanguage(
 
   return false;
 }
+
+
+// ============================================================
+// Folder creation
+// ============================================================
 
 async function createFolderFromPath(
   userId,
@@ -3887,12 +5536,17 @@ async function createFolderFromPath(
   const created = [];
 
   for (const name of parts) {
-    let f;
+    let folder;
 
-    if (parent === null) {
-      f =
+    if (
+      parent === null
+    ) {
+      folder =
         await env.DB.prepare(`
-          SELECT id,name,parent_id
+          SELECT
+            id,
+            name,
+            parent_id
           FROM folders
           WHERE user_id = ?
             AND name = ?
@@ -3903,9 +5557,12 @@ async function createFolderFromPath(
           name
         ).first();
     } else {
-      f =
+      folder =
         await env.DB.prepare(`
-          SELECT id,name,parent_id
+          SELECT
+            id,
+            name,
+            parent_id
           FROM folders
           WHERE user_id = ?
             AND name = ?
@@ -3918,8 +5575,8 @@ async function createFolderFromPath(
         ).first();
     }
 
-    if (!f) {
-      const r =
+    if (!folder) {
+      const result =
         await env.DB.prepare(`
           INSERT INTO folders(
             user_id,
@@ -3934,25 +5591,30 @@ async function createFolderFromPath(
         ).run();
 
       parent =
-        r.meta.last_row_id;
+        result.meta.last_row_id;
 
-      created.push(name);
+      created.push(
+        name
+      );
     } else {
-      parent = f.id;
+      parent =
+        folder.id;
     }
   }
 
   return {
     message:
       created.length
-        ? `好的，主人。\n\n📁 已经准备好：<code>${escapeHtml(
+        ? `好的，主人。\n\n` +
+          `📁 已创建：<code>${escapeHtml(
             parts.join("/")
           )}</code>`
-        : `这个文件夹本来就已经存在：<code>${escapeHtml(
+        : `这个文件夹已经存在：<code>${escapeHtml(
             parts.join("/")
           )}</code>`
   };
 }
+
 
 async function findFolderByPath(
   userId,
@@ -3967,13 +5629,20 @@ async function findFolderByPath(
       .filter(Boolean);
 
   let parent = null;
-  let f = null;
+  let folder = null;
 
-  for (const name of parts) {
-    if (parent === null) {
-      f =
+  for (
+    const name of parts
+  ) {
+    if (
+      parent === null
+    ) {
+      folder =
         await env.DB.prepare(`
-          SELECT id,name,parent_id
+          SELECT
+            id,
+            name,
+            parent_id
           FROM folders
           WHERE user_id = ?
             AND name = ?
@@ -3984,9 +5653,12 @@ async function findFolderByPath(
           name
         ).first();
     } else {
-      f =
+      folder =
         await env.DB.prepare(`
-          SELECT id,name,parent_id
+          SELECT
+            id,
+            name,
+            parent_id
           FROM folders
           WHERE user_id = ?
             AND name = ?
@@ -3999,106 +5671,105 @@ async function findFolderByPath(
         ).first();
     }
 
-    if (!f) return null;
+    if (!folder) {
+      return null;
+    }
 
-    parent = f.id;
+    parent =
+      folder.id;
   }
 
-  return f;
+  return folder;
 }
 
-async function searchFiles(
+
+// ============================================================
+// DB helpers
+// ============================================================
+
+async function getFile(
   userId,
-  chatId,
-  keyword,
+  id,
   env
 ) {
-  const p =
-    `%${String(
-      keyword || ""
-    ).trim()}%`;
-
-  const files =
-    (
-      await env.DB.prepare(`
-        SELECT id,file_name,custom_id,mime_type
-        FROM files
-        WHERE user_id = ?
-          AND (
-            file_name LIKE ?
-            OR custom_id LIKE ?
-          )
-        ORDER BY created_at DESC
-        LIMIT 50
-      `).bind(
-        userId,
-        p,
-        p
-      ).all()
-    ).results || [];
-
-  const folders =
-    (
-      await env.DB.prepare(`
-        SELECT id,name
-        FROM folders
-        WHERE user_id = ?
-          AND name LIKE ?
-        ORDER BY name
-        LIMIT 20
-      `).bind(
-        userId,
-        p
-      ).all()
-    ).results || [];
-
-  const buttons = [
-    ...files.map(
-      f => [
-        {
-          text:
-            `${getResourceIcon(
-              f.mime_type
-            )} ` +
-            `${f.custom_id || "无ID"} · ` +
-            `${truncate(
-              f.file_name,
-              20
-            )}`,
-          callback_data:
-            `file:${f.id}`
-        }
-      ]
-    ),
-
-    ...folders.map(
-      f => [
-        {
-          text:
-            `📁 ${f.name}`,
-          callback_data:
-            `folder:${f.id}`
-        }
-      ]
-    )
-  ];
-
-  return sendMessage(
-    chatId,
-    `🔎 <b>搜索结果</b>\n\n` +
-      `资源：${files.length}\n` +
-      `文件夹：${folders.length}`,
-    {
-      reply_markup: {
-        inline_keyboard:
-          buttons
-      }
-    },
-    env
-  );
+  return env.DB.prepare(`
+    SELECT *
+    FROM files
+    WHERE user_id = ?
+      AND id = ?
+    LIMIT 1
+  `).bind(
+    userId,
+    id
+  ).first();
 }
 
-/* -------------------- State DB -------------------- */
+
+async function getFolder(
+  userId,
+  id,
+  env
+) {
+  return env.DB.prepare(`
+    SELECT
+      id,
+      name,
+      parent_id,
+      created_at
+    FROM folders
+    WHERE user_id = ?
+      AND id = ?
+    LIMIT 1
+  `).bind(
+    userId,
+    id
+  ).first();
+}
+
+
+async function getFolderPath(
+  userId,
+  id,
+  env
+) {
+  const result = [];
+
+  let current =
+    id;
+
+  for (
+    let i = 0;
+    current !== null &&
+    current !== undefined &&
+    i < 100;
+    i++
+  ) {
+    const folder =
+      await getFolder(
+        userId,
+        current,
+        env
+      );
+
+    if (!folder) {
+      break;
+    }
+
+    result.unshift(
+      folder.name
+    );
+
+    current =
+      folder.parent_id;
+  }
+
+  return result.join("/");
+}
+
+
+// ============================================================
+// State DB
+// ============================================================
 
 async function getStateRecord(
   userId,
@@ -4119,17 +5790,20 @@ async function getStateRecord(
   ).first();
 }
 
+
 async function getState(
   userId,
   env
 ) {
-  return (
+  const row =
     await getStateRecord(
       userId,
       env
-    )
-  )?.state || null;
+    );
+
+  return row?.state || null;
 }
+
 
 async function setState(
   userId,
@@ -4157,6 +5831,7 @@ async function setState(
   ).run();
 }
 
+
 async function clearState(
   userId,
   env
@@ -4174,6 +5849,7 @@ async function clearState(
     userId
   ).run();
 }
+
 
 async function setLastFolder(
   userId,
@@ -4193,66 +5869,293 @@ async function setLastFolder(
     )
     ON CONFLICT(chat_id)
     DO UPDATE SET
-      last_folder_id = excluded.last_folder_id,
-      updated_at = CURRENT_TIMESTAMP
+      last_folder_id =
+        excluded.last_folder_id,
+      updated_at =
+        CURRENT_TIMESTAMP
   `).bind(
     userId,
     folderId
   ).run();
 }
 
-/* -------------------- Helpers -------------------- */
+
+// ============================================================
+// UI helpers
+// ============================================================
+
+async function renderMenu(
+  chatId,
+  messageId,
+  text,
+  replyMarkup,
+  env
+) {
+  if (messageId) {
+    const result =
+      await editMessage(
+        chatId,
+        messageId,
+        text,
+        {
+          reply_markup:
+            replyMarkup
+        },
+        env
+      );
+
+    if (result?.ok) {
+      return result;
+    }
+  }
+
+  return sendMessage(
+    chatId,
+    text,
+    {
+      reply_markup:
+        replyMarkup
+    },
+    env
+  );
+}
+
+
+function paginationButtons(
+  prefix,
+  page,
+  totalPages
+) {
+  if (
+    totalPages <= 1
+  ) {
+    return [];
+  }
+
+  let previous =
+    "noop";
+
+  let next =
+    "noop";
+
+  if (
+    page > 0
+  ) {
+    if (
+      prefix === "recent"
+    ) {
+      previous =
+        `recent:${page - 1}`;
+    } else if (
+      prefix === "rootpage"
+    ) {
+      previous =
+        "folderroot";
+    } else if (
+      prefix.startsWith(
+        "folderpage:"
+      )
+    ) {
+      const id =
+        prefix.slice(
+          "folderpage:".length
+        );
+
+      previous =
+        `folder:${id}:${page - 1}`;
+    }
+  }
+
+  if (
+    page <
+    totalPages - 1
+  ) {
+    if (
+      prefix === "recent"
+    ) {
+      next =
+        `recent:${page + 1}`;
+    } else if (
+      prefix.startsWith(
+        "folderpage:"
+      )
+    ) {
+      const id =
+        prefix.slice(
+          "folderpage:".length
+        );
+
+      next =
+        `folder:${id}:${page + 1}`;
+    } else if (
+      prefix === "rootpage"
+    ) {
+      next =
+        "folderroot";
+    }
+  }
+
+  return [
+    {
+      text:
+        page > 0
+          ? "⬅️"
+          : "·",
+      callback_data:
+        previous
+    },
+    {
+      text:
+        `${page + 1}/${totalPages}`,
+      callback_data:
+        "noop"
+    },
+    {
+      text:
+        page <
+        totalPages - 1
+          ? "➡️"
+          : "·",
+      callback_data:
+        next
+    }
+  ];
+}
+
+
+// ============================================================
+// Generic helpers
+// ============================================================
 
 function containsUrl(t) {
   return !!extractFirstUrl(t);
 }
 
+
 function extractFirstUrl(t) {
-  const m =
-    String(t || "").match(
+  const match =
+    String(
+      t || ""
+    ).match(
       /(?:(?:https?:\/\/)|www\.)[^\s<>"']+/i
     );
 
-  if (!m) return null;
+  if (!match) {
+    return null;
+  }
 
-  let u =
-    m[0].replace(
+  let url =
+    match[0].replace(
       /[，。！？；：）》）】》"'、]+$/g,
       ""
     );
 
-  return u.startsWith("www.")
-    ? "https://" + u
-    : u;
+  if (
+    url.startsWith(
+      "www."
+    )
+  ) {
+    url =
+      "https://" +
+      url;
+  }
+
+  return url;
 }
 
-function getResourceIcon(m) {
+
+function normalizeUrl(url) {
+  try {
+    const parsed =
+      new URL(
+        String(url)
+          .trim()
+      );
+
+    parsed.hash = "";
+
+    parsed.hostname =
+      parsed.hostname
+        .toLowerCase();
+
+    /*
+     * 默认端口不是 URL 身份的一部分。
+     */
+    if (
+      (
+        parsed.protocol ===
+          "https:" &&
+        parsed.port ===
+          "443"
+      ) ||
+      (
+        parsed.protocol ===
+          "http:" &&
+        parsed.port ===
+          "80"
+      )
+    ) {
+      parsed.port = "";
+    }
+
+    /*
+     * 尾部 slash：
+     *
+     * example.com
+     * example.com/
+     *
+     * 视为同一个 URL。
+     */
+    if (
+      parsed.pathname === "/"
+    ) {
+      parsed.pathname = "";
+    }
+
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+}
+
+
+function getResourceIcon(
+  mime
+) {
   if (
-    m === "media/media_group"
+    mime ===
+    "media/media_group"
   ) {
     return "📦";
   }
 
   if (
-    m === "text/link"
+    mime ===
+    "text/link"
   ) {
     return "🔗";
   }
 
   if (
-    m?.startsWith("image/")
+    mime?.startsWith(
+      "image/"
+    )
   ) {
     return "🖼";
   }
 
   if (
-    m?.startsWith("video/")
+    mime?.startsWith(
+      "video/"
+    )
   ) {
     return "🎬";
   }
 
   if (
-    m?.startsWith("audio/")
+    mime?.startsWith(
+      "audio/"
+    )
   ) {
     return "🎵";
   }
@@ -4260,8 +6163,97 @@ function getResourceIcon(m) {
   return "📄";
 }
 
+
+function inferMediaKind(
+  mime
+) {
+  if (
+    mime?.startsWith(
+      "image/"
+    )
+  ) {
+    return "photo";
+  }
+
+  if (
+    mime?.startsWith(
+      "video/"
+    )
+  ) {
+    return "video";
+  }
+
+  if (
+    mime?.startsWith(
+      "audio/"
+    )
+  ) {
+    return "audio";
+  }
+
+  return "document";
+}
+
+
+function normalizeMediaGroupItems(
+  items
+) {
+  const result = [];
+  const seenMessages =
+    new Set();
+
+  for (
+    const item of
+    items || []
+  ) {
+    const messageId =
+      String(
+        item.messageId
+      );
+
+    if (
+      seenMessages.has(
+        messageId
+      )
+    ) {
+      continue;
+    }
+
+    seenMessages.add(
+      messageId
+    );
+
+    result.push(
+      item
+    );
+  }
+
+  return result.sort(
+    (a, b) =>
+      Number(
+        a.messageId
+      ) -
+      Number(
+        b.messageId
+      )
+  );
+}
+
+
+function cleanIdentity(v) {
+  const value =
+    String(
+      v ?? ""
+    ).trim();
+
+  return value || null;
+}
+
+
 function cleanNaturalPath(t) {
-  return String(t || "")
+  return String(
+    t || ""
+  )
     .trim()
     .replace(
       /^['"“”‘’]+|['"“”‘’]+$/g,
@@ -4286,27 +6278,75 @@ function cleanNaturalPath(t) {
     .trim();
 }
 
-function truncate(t, n) {
+
+function truncate(
+  t,
+  n
+) {
   const s =
-    String(t || "");
+    String(
+      t || ""
+    );
 
   return s.length <= n
     ? s
-    : s.slice(0, n - 1) + "…";
+    : s.slice(
+        0,
+        n - 1
+      ) + "…";
 }
 
-function formatFileSize(b) {
-  if (b < 1024) {
+
+function clampPage(
+  page,
+  totalPages
+) {
+  const n =
+    Number.isFinite(
+      Number(page)
+    )
+      ? Number(page)
+      : 0;
+
+  return Math.max(
+    0,
+    Math.min(
+      n,
+      totalPages - 1
+    )
+  );
+}
+
+
+function formatFileSize(
+  bytes
+) {
+  const b =
+    Number(bytes);
+
+  if (
+    !Number.isFinite(b)
+  ) {
+    return "未知";
+  }
+
+  if (
+    b < 1024
+  ) {
     return `${b} B`;
   }
 
-  if (b < 1048576) {
+  if (
+    b < 1048576
+  ) {
     return `${(
       b / 1024
     ).toFixed(1)} KB`;
   }
 
-  if (b < 1073741824) {
+  if (
+    b < 1073741824
+  ) {
     return `${(
       b / 1048576
     ).toFixed(1)} MB`;
@@ -4317,8 +6357,11 @@ function formatFileSize(b) {
   ).toFixed(2)} GB`;
 }
 
+
 function escapeHtml(t) {
-  return String(t ?? "")
+  return String(
+    t ?? ""
+  )
     .replace(
       /&/g,
       "&amp;"
@@ -4337,6 +6380,7 @@ function escapeHtml(t) {
     );
 }
 
+
 function escapeRegExp(t) {
   return String(t).replace(
     /[.*+?^${}()|[\]\\]/g,
@@ -4344,9 +6388,14 @@ function escapeRegExp(t) {
   );
 }
 
-function cleanIdPrefix(n) {
-  const p =
-    String(n)
+
+function cleanIdPrefix(
+  name
+) {
+  const prefix =
+    String(
+      name || ""
+    )
       .trim()
       .replace(
         /\s+/g,
@@ -4358,12 +6407,21 @@ function cleanIdPrefix(n) {
       );
 
   return (
-    p || "FILE"
-  ).slice(0, 30);
+    prefix ||
+    "FILE"
+  ).slice(
+    0,
+    30
+  );
 }
 
-function sanitizeName(s) {
-  return String(s || "")
+
+function sanitizeName(
+  value
+) {
+  return String(
+    value || ""
+  )
     .replace(
       /\s+/g,
       " "
@@ -4373,89 +6431,106 @@ function sanitizeName(s) {
       ""
     )
     .trim()
-    .slice(0, 80);
+    .slice(
+      0,
+      80
+    );
 }
 
-function deriveName(r) {
-  let n = "";
 
-  if (r.type === "link") {
-    n =
+function deriveName(
+  resource
+) {
+  let name = "";
+
+  if (
+    resource.type ===
+    "link"
+  ) {
+    name =
       sanitizeName(
-        r.text
+        resource.text
       )
         .replace(
           /https?:\/\/\S+/g,
           ""
         )
         .trim();
-  } else if (
-    r.type === "media_group"
+
+    if (!name) {
+      try {
+        name =
+          new URL(
+            resource.url
+          ).hostname;
+      } catch {}
+    }
+  }
+
+  else if (
+    resource.type ===
+    "media_group"
   ) {
-    n =
-      sanitizeName(
-        r.items?.[0]?.caption
-      ) ||
-      (
-        (r.items || []).some(
+    const caption =
+      resource.items
+        ?.map(
           x =>
-            x.kind === "photo"
-        ) &&
-        (r.items || []).some(
-          x =>
-            x.kind === "video"
+            sanitizeName(
+              x.caption
+            )
         )
-      )
-        ? `图片+视频组_${r.items.length}项`
-        : (r.items || []).some(
-            x =>
-              x.kind === "photo"
-          )
-          ? `图片组_${r.items.length}张`
-          : `媒体组_${
-              r.items?.length ||
-              0
-            }项`;
-  } else {
-    n =
+        .find(Boolean);
+
+    if (caption) {
+      name =
+        caption;
+    } else {
+      name =
+        `媒体组_${resource.items?.length || 0}项`;
+    }
+  }
+
+  else {
+    name =
       sanitizeName(
-        r.caption
-      ) ||
-      (r.fileName || "")
-        .replace(
+        resource.caption
+      );
+
+    if (!name) {
+      name =
+        String(
+          resource.fileName ||
+          ""
+        ).replace(
           /\.[a-z0-9]+$/i,
           ""
         );
+    }
   }
 
   return (
-    n ||
-    `${
-      r.type === "link"
+    name ||
+    (
+      resource.type ===
+      "link"
         ? "链接"
-        : r.type ===
+        : resource.type ===
           "media_group"
           ? "媒体组"
           : "文件"
-    }_${Date.now()}`
+    ) +
+      "_" +
+      Date.now()
   );
 }
 
-function uniqueBy(
-  arr,
-  key
-) {
-  const m =
-    new Map();
 
-  for (const x of arr) {
-    m.set(
-      key(x),
-      x
-    );
-  }
-
-  return [
-    ...m.values()
-  ];
+function sleep(ms) {
+  return new Promise(
+    resolve =>
+      setTimeout(
+        resolve,
+        ms
+      )
+  );
 }
