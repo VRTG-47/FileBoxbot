@@ -8,6 +8,12 @@
       "binding": "DB",
       "database_name": "iresiabot-file-db",
       "database_id": "e71d82da-a001-49b9-a1b3-1d50deeb37da"
-    }
+    },
   ]
+  "observability": {
+    "logs": {
+      "enabled": true,
+      "invocation_logs": true
+    }
+  }
 }
